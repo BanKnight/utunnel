@@ -126,6 +126,12 @@ const buildRelayRequestPath = (requestUrl: string) => {
   return nextPath
 }
 
+type RelayHttpRequest = {
+  expectedSessionId: string
+  expectedVersion: number
+  request: HttpRequestMessage
+}
+
 export const createEdgeApp = () => {
   const app = new Hono<HonoEnv>()
 
@@ -346,15 +352,19 @@ export const createEdgeApp = () => {
     }
 
     const route = (await resolveRes.json()) as RoutingEntry
-    const relayRequest: HttpRequestMessage = {
-      type: 'http_request',
-      payload: {
-        streamId: crypto.randomUUID(),
-        serviceId: route.serviceId,
-        method: c.req.method,
-        path: relayPath,
-        headers: buildRelayRequestHeaders(c.req.raw),
-        body: ['GET', 'HEAD'].includes(c.req.method.toUpperCase()) ? '' : await c.req.raw.text(),
+    const relayRequest: RelayHttpRequest = {
+      expectedSessionId: route.sessionId,
+      expectedVersion: route.version,
+      request: {
+        type: 'http_request',
+        payload: {
+          streamId: crypto.randomUUID(),
+          serviceId: route.serviceId,
+          method: c.req.method,
+          path: relayPath,
+          headers: buildRelayRequestHeaders(c.req.raw),
+          body: ['GET', 'HEAD'].includes(c.req.method.toUpperCase()) ? '' : await c.req.raw.text(),
+        },
       },
     }
 

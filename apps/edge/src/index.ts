@@ -53,6 +53,12 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
   }
 }
 
+type RelayHttpRequest = {
+  expectedSessionId: string
+  expectedVersion: number
+  request: HttpRequestMessage
+}
+
 export class HostSession extends DurableObject<EdgeBindings> {
   private pendingResponses = new Map<string, (message: HttpResponseMessage) => void>()
 
@@ -69,7 +75,17 @@ export class HostSession extends DurableObject<EdgeBindings> {
     return typeof message === 'string' ? message : decoder.decode(message)
   }
 
-  private async relayHttpRequest(payload: HttpRequestMessage) {
+  private async relayHttpRequest(payload: RelayHttpRequest) {
+    const session = await this.ctx.storage.get<HostSessionRecord>('session')
+    if (
+      !session ||
+      session.disconnectedAt !== null ||
+      session.sessionId !== payload.expectedSessionId ||
+      session.version !== payload.expectedVersion
+    ) {
+      return Response.json({ ok: false, reason: 'stale_session_binding' }, { status: 409 })
+    }
+
     const socket = this.getConnectedSocket()
     if (!socket) {
       return Response.json({ ok: false, reason: 'host_not_connected' }, { status: 503 })
@@ -77,16 +93,16 @@ export class HostSession extends DurableObject<EdgeBindings> {
 
     const responseMessage = await new Promise<HttpResponseMessage>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        this.pendingResponses.delete(payload.payload.streamId)
+        this.pendingResponses.delete(payload.request.payload.streamId)
         reject(new Error('relay_timeout'))
       }, 5_000)
 
-      this.pendingResponses.set(payload.payload.streamId, (message) => {
+      this.pendingResponses.set(payload.request.payload.streamId, (message) => {
         clearTimeout(timeout)
         resolve(message)
       })
 
-      socket.send(JSON.stringify(payload))
+      socket.send(JSON.stringify(payload.request))
     })
 
     return new Response(responseMessage.payload.body, {
@@ -117,7 +133,7 @@ export class HostSession extends DurableObject<EdgeBindings> {
     }
 
     if (request.method === 'POST' && url.pathname === '/relay-http') {
-      return this.relayHttpRequest((await request.json()) as HttpRequestMessage)
+      return this.relayHttpRequest((await request.json()) as RelayHttpRequest)
     }
 
     if (request.method === 'POST' && url.pathname === '/disconnect') {

@@ -86,26 +86,39 @@ class FakeHostStub {
 
     if (request.method === 'POST' && url.pathname === '/relay-http') {
       const relay = (await request.json()) as {
-        payload: {
-          method: string
-          path: string
-          serviceId: string
-          streamId: string
-          headers: Record<string, string>
+        expectedSessionId: string
+        expectedVersion: number
+        request: {
+          payload: {
+            method: string
+            path: string
+            serviceId: string
+            streamId: string
+            headers: Record<string, string>
+          }
         }
+      }
+
+      if (
+        !this.session ||
+        this.session.disconnectedAt !== null ||
+        this.session.sessionId !== relay.expectedSessionId ||
+        this.session.version !== relay.expectedVersion
+      ) {
+        return Response.json({ ok: false, reason: 'stale_session_binding' }, { status: 409 })
       }
 
       return Response.json(
         {
           ok: true,
-          serviceId: relay.payload.serviceId,
-          path: relay.payload.path,
-          method: relay.payload.method,
-          streamId: relay.payload.streamId,
-          forwardedHostHeader: relay.payload.headers.host ?? null,
-          forwardedXffHeader: relay.payload.headers['x-forwarded-for'] ?? null,
-          forwardedPortHeader: relay.payload.headers['x-forwarded-port'] ?? null,
-          proxyAuthorizationHeader: relay.payload.headers['proxy-authorization'] ?? null,
+          serviceId: relay.request.payload.serviceId,
+          path: relay.request.payload.path,
+          method: relay.request.payload.method,
+          streamId: relay.request.payload.streamId,
+          forwardedHostHeader: relay.request.payload.headers.host ?? null,
+          forwardedXffHeader: relay.request.payload.headers['x-forwarded-for'] ?? null,
+          forwardedPortHeader: relay.request.payload.headers['x-forwarded-port'] ?? null,
+          proxyAuthorizationHeader: relay.request.payload.headers['proxy-authorization'] ?? null,
         },
         {
           headers: {
@@ -389,6 +402,53 @@ describe('edge app integration', () => {
     expect(response.status).toBe(400)
     const json = (await response.json()) as { error: string }
     expect(json).toEqual({ error: 'invalid_relay_path' })
+  })
+
+  test('fails closed when route still points at a disconnected session', async () => {
+    const env = createEnv()
+    const authHeader = {
+      authorization: `Bearer ${buildHostToken('host-1', env.OPERATOR_TOKEN)}`,
+      'content-type': 'application/json',
+    }
+
+    await app.request(
+      'http://edge.test/api/hosts/host-1/services',
+      {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({
+          sessionId: 'session-1',
+          version: 1,
+          services: [
+            {
+              serviceId: 'svc-1',
+              serviceName: 'echo',
+              localUrl: 'http://127.0.0.1:3001',
+              protocol: 'http',
+              subdomain: 'echo.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+
+    const disconnect = await app.request(
+      'http://edge.test/api/hosts/host-1/disconnect',
+      { method: 'POST', headers: authHeader },
+      env,
+    )
+    expect(disconnect.status).toBe(200)
+
+    const response = await app.request(
+      'http://edge.test/tunnel/status',
+      { headers: { host: 'echo.example.test' } },
+      env,
+    )
+    const json = (await response.json()) as { ok: false; reason: string }
+
+    expect(response.status).toBe(409)
+    expect(json.reason).toBe('stale_session_binding')
   })
 
   test('rejects rebind when previous session id mismatches', async () => {
