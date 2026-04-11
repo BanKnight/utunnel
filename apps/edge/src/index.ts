@@ -1,9 +1,36 @@
 import { DurableObject } from 'cloudflare:workers'
-import { responseEnvelopeSchema, type HostSessionRecord, type HttpRequestMessage, type HttpResponseMessage, type RoutingEntry } from '@utunnel/protocol'
+import {
+  responseEnvelopeSchema,
+  websocketCloseSchema,
+  websocketFrameSchema,
+  type HostSessionRecord,
+  type HttpRequestMessage,
+  type HttpResponseMessage,
+  type RoutingEntry,
+  type WebSocketCloseMessage,
+  type WebSocketFrameMessage,
+  type WebSocketOpenMessage,
+} from '@utunnel/protocol'
 import { app, type EdgeBindings } from './app'
 import { markSessionDisconnected } from './lib'
 
 const decoder = new TextDecoder()
+
+type RelayHttpRequest = {
+  expectedSessionId: string
+  expectedVersion: number
+  request: HttpRequestMessage
+}
+
+type RelayWebSocketRequest = {
+  expectedSessionId: string
+  expectedVersion: number
+  request: WebSocketOpenMessage
+}
+
+type ConnectionRole =
+  | { type: 'host' }
+  | { type: 'client'; streamId: string }
 
 export class RoutingDirectory extends DurableObject<EdgeBindings> {
   async fetch(request: Request): Promise<Response> {
@@ -53,12 +80,6 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
   }
 }
 
-type RelayHttpRequest = {
-  expectedSessionId: string
-  expectedVersion: number
-  request: HttpRequestMessage
-}
-
 export class HostSession extends DurableObject<EdgeBindings> {
   private pendingResponses = new Map<string, (message: HttpResponseMessage) => void>()
 
@@ -67,26 +88,42 @@ export class HostSession extends DurableObject<EdgeBindings> {
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'))
   }
 
-  private getConnectedSocket() {
-    return this.ctx.getWebSockets()[0]
+  private getHostSocket() {
+    return this.ctx.getWebSockets('host')[0]
+  }
+
+  private getClientSocket(streamId: string) {
+    return this.ctx.getWebSockets(streamId)[0]
   }
 
   private readMessage(message: string | ArrayBuffer) {
     return typeof message === 'string' ? message : decoder.decode(message)
   }
 
-  private async relayHttpRequest(payload: RelayHttpRequest) {
+  private getSocketRole(ws: WebSocket) {
+    return ws.deserializeAttachment() as ConnectionRole | null
+  }
+
+  private async ensureActiveSession(expectedSessionId: string, expectedVersion: number) {
     const session = await this.ctx.storage.get<HostSessionRecord>('session')
     if (
       !session ||
       session.disconnectedAt !== null ||
-      session.sessionId !== payload.expectedSessionId ||
-      session.version !== payload.expectedVersion
+      session.sessionId !== expectedSessionId ||
+      session.version !== expectedVersion
     ) {
+      return null
+    }
+    return session
+  }
+
+  private async relayHttpRequest(payload: RelayHttpRequest) {
+    const session = await this.ensureActiveSession(payload.expectedSessionId, payload.expectedVersion)
+    if (!session) {
       return Response.json({ ok: false, reason: 'stale_session_binding' }, { status: 409 })
     }
 
-    const socket = this.getConnectedSocket()
+    const socket = this.getHostSocket()
     if (!socket) {
       return Response.json({ ok: false, reason: 'host_not_connected' }, { status: 503 })
     }
@@ -111,14 +148,43 @@ export class HostSession extends DurableObject<EdgeBindings> {
     })
   }
 
+  private async relayWebSocket(request: Request, payload: RelayWebSocketRequest) {
+    const session = await this.ensureActiveSession(payload.expectedSessionId, payload.expectedVersion)
+    if (!session) {
+      return Response.json({ ok: false, reason: 'stale_session_binding' }, { status: 409 })
+    }
+
+    const hostSocket = this.getHostSocket()
+    if (!hostSocket) {
+      return Response.json({ ok: false, reason: 'host_not_connected' }, { status: 503 })
+    }
+
+    if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
+      return new Response('Expected WebSocket', { status: 426 })
+    }
+
+    const pair = new WebSocketPair()
+    const client = pair[0]
+    const server = pair[1]
+    this.ctx.acceptWebSocket(server, [payload.request.payload.streamId])
+    server.serializeAttachment({ type: 'client', streamId: payload.request.payload.streamId } satisfies ConnectionRole)
+    hostSocket.send(JSON.stringify(payload.request))
+    return new Response(null, { status: 101, webSocket: client })
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url)
 
     if (request.headers.get('Upgrade') === 'websocket' && url.pathname === '/connect') {
+      for (const existing of this.ctx.getWebSockets('host')) {
+        existing.close(1012, 'replaced_host_socket')
+      }
+
       const pair = new WebSocketPair()
       const client = pair[0]
       const server = pair[1]
-      this.ctx.acceptWebSocket(server)
+      this.ctx.acceptWebSocket(server, ['host'])
+      server.serializeAttachment({ type: 'host' } satisfies ConnectionRole)
       return new Response(null, { status: 101, webSocket: client })
     }
 
@@ -134,6 +200,10 @@ export class HostSession extends DurableObject<EdgeBindings> {
 
     if (request.method === 'POST' && url.pathname === '/relay-http') {
       return this.relayHttpRequest((await request.json()) as RelayHttpRequest)
+    }
+
+    if (request.method === 'POST' && url.pathname === '/relay-ws') {
+      return this.relayWebSocket(request, (await request.json()) as RelayWebSocketRequest)
     }
 
     if (request.method === 'POST' && url.pathname === '/disconnect') {
@@ -160,26 +230,91 @@ export class HostSession extends DurableObject<EdgeBindings> {
     return Response.json({ error: 'not_found' }, { status: 404 })
   }
 
-  async webSocketMessage(_ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     const text = this.readMessage(message)
     if (text === 'ping' || text === 'pong') {
       return
     }
 
-    let parsed: HttpResponseMessage
-    try {
-      parsed = responseEnvelopeSchema.parse(JSON.parse(text))
-    } catch {
+    const role = this.getSocketRole(ws)
+    if (!role) {
       return
     }
 
-    const resolve = this.pendingResponses.get(parsed.payload.streamId)
-    if (!resolve) {
+    if (role.type === 'host') {
+      let httpParsed: HttpResponseMessage | null = null
+      try {
+        httpParsed = responseEnvelopeSchema.parse(JSON.parse(text))
+      } catch {}
+
+      if (httpParsed) {
+        const resolve = this.pendingResponses.get(httpParsed.payload.streamId)
+        if (!resolve) {
+          return
+        }
+
+        this.pendingResponses.delete(httpParsed.payload.streamId)
+        resolve(httpParsed)
+        return
+      }
+
+      let wsFrame: WebSocketFrameMessage | null = null
+      try {
+        wsFrame = websocketFrameSchema.parse(JSON.parse(text))
+      } catch {}
+
+      if (wsFrame) {
+        this.getClientSocket(wsFrame.payload.streamId)?.send(wsFrame.payload.data)
+        return
+      }
+
+      let wsClose: WebSocketCloseMessage | null = null
+      try {
+        wsClose = websocketCloseSchema.parse(JSON.parse(text))
+      } catch {}
+
+      if (wsClose) {
+        this.getClientSocket(wsClose.payload.streamId)?.close(wsClose.payload.code, wsClose.payload.reason)
+      }
+
       return
     }
 
-    this.pendingResponses.delete(parsed.payload.streamId)
-    resolve(parsed)
+    const frameMessage: WebSocketFrameMessage = {
+      type: 'ws_frame',
+      payload: {
+        streamId: role.streamId,
+        data: text,
+      },
+    }
+    this.getHostSocket()?.send(JSON.stringify(frameMessage))
+  }
+
+  async webSocketClose(ws: WebSocket, code: number, reason: string, _wasClean: boolean): Promise<void> {
+    const role = this.getSocketRole(ws)
+    if (!role) {
+      return
+    }
+
+    if (role.type === 'client') {
+      const closeMessage: WebSocketCloseMessage = {
+        type: 'ws_close',
+        payload: {
+          streamId: role.streamId,
+          code,
+          reason,
+        },
+      }
+      this.getHostSocket()?.send(JSON.stringify(closeMessage))
+      return
+    }
+
+    for (const client of this.ctx.getWebSockets()) {
+      const clientRole = client.deserializeAttachment() as ConnectionRole | null
+      if (clientRole?.type === 'client') {
+        client.close(1011, 'host_socket_closed')
+      }
+    }
   }
 }
 

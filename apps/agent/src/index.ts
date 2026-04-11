@@ -1,7 +1,15 @@
 import { parseAgentConfig } from '@utunnel/config'
 import type { AgentConfig } from '@utunnel/config'
-import type { HttpRequestMessage, HttpResponseMessage, ServiceDefinition, TunnelMessage } from '@utunnel/protocol'
-import { requestEnvelopeSchema } from '@utunnel/protocol'
+import type {
+  HttpRequestMessage,
+  HttpResponseMessage,
+  ServiceDefinition,
+  TunnelMessage,
+  WebSocketCloseMessage,
+  WebSocketFrameMessage,
+  WebSocketOpenMessage,
+} from '@utunnel/protocol'
+import { tunnelMessageSchema } from '@utunnel/protocol'
 import {
   buildServiceBindingPayload,
   createDefaultAgentConfig,
@@ -9,6 +17,28 @@ import {
   resolveRegistrationPath,
 } from './runtime'
 import type { RuntimeState } from './runtime'
+
+type EdgeSocketLike = {
+  send(data: string): void
+}
+
+type UpstreamSocketEvent = {
+  code?: number
+  data?: string | ArrayBuffer | Uint8Array
+  reason?: string
+}
+
+type UpstreamSocketLike = {
+  addEventListener(type: string, listener: (event?: UpstreamSocketEvent) => void, options?: AddEventListenerOptions): void
+  close(code?: number, reason?: string): void
+  send(data: string): void
+}
+
+type CreateUpstreamSocket = (url: string, headers: Record<string, string>) => UpstreamSocketLike
+
+export type RelayState = {
+  websocketStreams: Map<string, UpstreamSocketLike>
+}
 
 const loadConfig = async () => {
   const configPath = process.env.UTUNNEL_AGENT_CONFIG ?? new URL('../agent.config.json', import.meta.url)
@@ -105,6 +135,31 @@ const buildUpstreamUrl = (service: ServiceDefinition, relayPath: string) => {
   return upstreamUrl
 }
 
+const buildUpstreamWebSocketUrl = (service: ServiceDefinition, relayPath: string) => {
+  const upstreamUrl = buildUpstreamUrl(service, relayPath)
+  if (upstreamUrl.protocol === 'http:') {
+    upstreamUrl.protocol = 'ws:'
+  } else if (upstreamUrl.protocol === 'https:') {
+    upstreamUrl.protocol = 'wss:'
+  }
+  return upstreamUrl
+}
+
+const toText = (value: string | ArrayBuffer | Uint8Array) => {
+  if (typeof value === 'string') {
+    return value
+  }
+  return new TextDecoder().decode(value)
+}
+
+const createUpstreamSocket: CreateUpstreamSocket = (url, headers) => {
+  return new WebSocket(url, { headers } as any) as unknown as UpstreamSocketLike
+}
+
+export const createRelayState = (): RelayState => ({
+  websocketStreams: new Map(),
+})
+
 export const forwardHttpRequest = async (
   services: ServiceDefinition[],
   message: HttpRequestMessage,
@@ -164,7 +219,101 @@ export const forwardHttpRequest = async (
   }
 }
 
+const sendSocketClose = (
+  edgeSocket: EdgeSocketLike,
+  streamId: string,
+  code: number | undefined,
+  reason: string | undefined,
+) => {
+  const closeMessage: WebSocketCloseMessage = {
+    type: 'ws_close',
+    payload: {
+      streamId,
+      ...(code === undefined ? {} : { code }),
+      ...(reason === undefined ? {} : { reason }),
+    },
+  }
+  edgeSocket.send(JSON.stringify(closeMessage))
+}
+
+const handleWebSocketOpen = async (
+  services: ServiceDefinition[],
+  message: WebSocketOpenMessage,
+  relayState: RelayState,
+  edgeSocket: EdgeSocketLike,
+  openSocket: CreateUpstreamSocket,
+) => {
+  const service = findServiceById(services, message.payload.serviceId)
+  if (!service || service.protocol !== 'websocket') {
+    sendSocketClose(edgeSocket, message.payload.streamId, 1011, 'service_not_found')
+    return
+  }
+
+  let upstreamUrl: URL
+  try {
+    upstreamUrl = buildUpstreamWebSocketUrl(service, message.payload.path)
+  } catch {
+    sendSocketClose(edgeSocket, message.payload.streamId, 1008, 'invalid_relay_path')
+    return
+  }
+
+  const upstreamSocket = openSocket(upstreamUrl.toString(), message.payload.headers)
+  relayState.websocketStreams.set(message.payload.streamId, upstreamSocket)
+
+  upstreamSocket.addEventListener('message', (event) => {
+    const frameMessage: WebSocketFrameMessage = {
+      type: 'ws_frame',
+      payload: {
+        streamId: message.payload.streamId,
+        data: toText(event?.data ?? ''),
+      },
+    }
+    edgeSocket.send(JSON.stringify(frameMessage))
+  })
+
+  upstreamSocket.addEventListener('close', (event) => {
+    relayState.websocketStreams.delete(message.payload.streamId)
+    sendSocketClose(edgeSocket, message.payload.streamId, event?.code, event?.reason)
+  })
+
+  upstreamSocket.addEventListener('error', () => {
+    relayState.websocketStreams.delete(message.payload.streamId)
+    sendSocketClose(edgeSocket, message.payload.streamId, 1011, 'upstream_websocket_error')
+  })
+}
+
+export const handleTunnelMessage = async (
+  message: TunnelMessage,
+  services: ServiceDefinition[],
+  relayState: RelayState,
+  edgeSocket: EdgeSocketLike,
+  openSocket: CreateUpstreamSocket = createUpstreamSocket,
+) => {
+  if (message.type === 'http_request') {
+    const response = await forwardHttpRequest(services, message)
+    edgeSocket.send(JSON.stringify(response))
+    return
+  }
+
+  if (message.type === 'ws_open') {
+    await handleWebSocketOpen(services, message, relayState, edgeSocket, openSocket)
+    return
+  }
+
+  if (message.type === 'ws_frame') {
+    relayState.websocketStreams.get(message.payload.streamId)?.send(message.payload.data)
+    return
+  }
+
+  if (message.type === 'ws_close') {
+    relayState.websocketStreams.get(message.payload.streamId)?.close(message.payload.code, message.payload.reason)
+    relayState.websocketStreams.delete(message.payload.streamId)
+  }
+}
+
 const attachRelayHandlers = (socket: WebSocket, services: ServiceDefinition[]) => {
+  const relayState = createRelayState()
+
   socket.addEventListener('message', async (event) => {
     if (typeof event.data !== 'string' || event.data === 'pong' || event.data === 'ping') {
       return
@@ -172,17 +321,12 @@ const attachRelayHandlers = (socket: WebSocket, services: ServiceDefinition[]) =
 
     let parsed: TunnelMessage
     try {
-      parsed = requestEnvelopeSchema.parse(JSON.parse(event.data))
+      parsed = tunnelMessageSchema.parse(JSON.parse(event.data))
     } catch {
       return
     }
 
-    if (parsed.type !== 'http_request') {
-      return
-    }
-
-    const response = await forwardHttpRequest(services, parsed)
-    socket.send(JSON.stringify(response))
+    await handleTunnelMessage(parsed, services, relayState, socket)
   })
 }
 

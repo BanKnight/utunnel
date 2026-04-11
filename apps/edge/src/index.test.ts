@@ -128,6 +128,31 @@ class FakeHostStub {
       )
     }
 
+    if (request.method === 'POST' && url.pathname === '/relay-ws') {
+      const relay = (await request.json()) as {
+        expectedSessionId: string
+        expectedVersion: number
+        request: {
+          payload: {
+            serviceId: string
+            streamId: string
+            path: string
+          }
+        }
+      }
+
+      if (
+        !this.session ||
+        this.session.disconnectedAt !== null ||
+        this.session.sessionId !== relay.expectedSessionId ||
+        this.session.version !== relay.expectedVersion
+      ) {
+        return Response.json({ ok: false, reason: 'stale_session_binding' }, { status: 409 })
+      }
+
+      return new Response(null, { status: 101 })
+    }
+
     if (request.method === 'POST' && url.pathname === '/disconnect') {
       if (!this.session) {
         return Response.json({ error: 'session_not_found' }, { status: 404 })
@@ -362,6 +387,50 @@ describe('edge app integration', () => {
     expect(json.forwardedXffHeader).toBeNull()
     expect(json.forwardedPortHeader).toBeNull()
     expect(json.proxyAuthorizationHeader).toBeNull()
+  })
+
+  test('upgrades websocket tunnel request to owning host session', async () => {
+    const env = createEnv()
+    const authHeader = {
+      authorization: `Bearer ${buildHostToken('host-1', env.OPERATOR_TOKEN)}`,
+      'content-type': 'application/json',
+    }
+
+    await app.request(
+      'http://edge.test/api/hosts/host-1/services',
+      {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({
+          sessionId: 'session-ws-1',
+          version: 1,
+          services: [
+            {
+              serviceId: 'svc-ws',
+              serviceName: 'echo-ws',
+              localUrl: 'http://127.0.0.1:3002',
+              protocol: 'websocket',
+              subdomain: 'ws.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+
+    const response = await app.request(
+      'http://edge.test/tunnel/socket?channel=1',
+      {
+        method: 'GET',
+        headers: {
+          host: 'ws.example.test',
+          upgrade: 'websocket',
+        },
+      },
+      env,
+    )
+
+    expect(response.status).toBe(101)
   })
 
   test('rejects invalid relay path before forwarding', async () => {

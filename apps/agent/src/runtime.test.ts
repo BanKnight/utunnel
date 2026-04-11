@@ -1,7 +1,34 @@
 import { describe, expect, test } from 'bun:test'
-import type { HttpRequestMessage } from '@utunnel/protocol'
+import type { HttpRequestMessage, WebSocketCloseMessage, WebSocketFrameMessage, WebSocketOpenMessage } from '@utunnel/protocol'
 import { buildServiceBindingPayload, createDefaultAgentConfig, createNextRuntimeState, resolveRegistrationPath } from './runtime'
-import { forwardHttpRequest } from './index'
+import { createRelayState, forwardHttpRequest, handleTunnelMessage } from './index'
+
+class FakeUpstreamSocket {
+  listeners = new Map<string, Array<(event?: { code?: number; data?: string; reason?: string }) => void>>()
+  sent: string[] = []
+  closed: Array<{ code?: number | undefined; reason?: string | undefined }> = []
+
+  addEventListener(type: string, listener: (event?: { code?: number; data?: string; reason?: string }) => void) {
+    if (!this.listeners.has(type)) {
+      this.listeners.set(type, [])
+    }
+    this.listeners.get(type)!.push(listener)
+  }
+
+  send(data: string) {
+    this.sent.push(data)
+  }
+
+  close(code?: number, reason?: string) {
+    this.closed.push({ code, reason })
+  }
+
+  emit(type: string, event?: { code?: number; data?: string; reason?: string }) {
+    for (const listener of this.listeners.get(type) ?? []) {
+      listener(event)
+    }
+  }
+}
 
 describe('agent runtime helpers', () => {
   test('creates initial and reconnect runtime states', () => {
@@ -104,4 +131,69 @@ describe('agent runtime helpers', () => {
     expect(response.payload.status).toBe(400)
     expect(response.payload.body).toBe('invalid_relay_path')
   })
+
+  test('relays websocket open frame and close messages', async () => {
+    const relayState = createRelayState()
+    const edgeMessages: string[] = []
+    const upstreamSocket = new FakeUpstreamSocket()
+    const openMessage: WebSocketOpenMessage = {
+      type: 'ws_open',
+      payload: {
+        streamId: 'ws-1',
+        serviceId: 'svc-ws',
+        path: '/socket',
+        headers: {},
+      },
+    }
+
+    await handleTunnelMessage(
+      openMessage,
+      [
+        {
+          serviceId: 'svc-ws',
+          serviceName: 'echo-ws',
+          localUrl: 'http://127.0.0.1:3001',
+          protocol: 'websocket',
+          subdomain: 'ws.example.test',
+        },
+      ],
+      relayState,
+      { send: (data: string) => edgeMessages.push(data) },
+      () => upstreamSocket,
+    )
+
+    expect(relayState.websocketStreams.get('ws-1')).toBe(upstreamSocket)
+
+    const frameFromEdge: WebSocketFrameMessage = {
+      type: 'ws_frame',
+      payload: {
+        streamId: 'ws-1',
+        data: 'hello',
+      },
+    }
+    await handleTunnelMessage(frameFromEdge, [], relayState, { send: () => {} })
+    expect(upstreamSocket.sent).toEqual(['hello'])
+
+    upstreamSocket.emit('message', { data: 'world' })
+    expect(edgeMessages).toHaveLength(1)
+    expect(JSON.parse(edgeMessages[0]!)).toEqual({
+      type: 'ws_frame',
+      payload: {
+        streamId: 'ws-1',
+        data: 'world',
+      },
+    })
+
+    const closeFromEdge: WebSocketCloseMessage = {
+      type: 'ws_close',
+      payload: {
+        streamId: 'ws-1',
+        code: 1000,
+        reason: 'done',
+      },
+    }
+    await handleTunnelMessage(closeFromEdge, [], relayState, { send: () => {} })
+    expect(upstreamSocket.closed).toEqual([{ code: 1000, reason: 'done' }])
+  })
 })
+

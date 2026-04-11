@@ -138,6 +138,9 @@ export type ServiceBindingPayload = z.infer<typeof serviceBindingPayloadSchema>
 export type HostSessionRecord = z.infer<typeof hostSessionRecordSchema>
 export type HttpRequestMessage = z.infer<typeof requestEnvelopeSchema>
 export type HttpResponseMessage = z.infer<typeof responseEnvelopeSchema>
+export type WebSocketOpenMessage = z.infer<typeof websocketOpenSchema>
+export type WebSocketFrameMessage = z.infer<typeof websocketFrameSchema>
+export type WebSocketCloseMessage = z.infer<typeof websocketCloseSchema>
 export type TunnelMessage = z.infer<typeof tunnelMessageSchema>
 
 export type RoutingEntry = {

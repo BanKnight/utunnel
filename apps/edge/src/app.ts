@@ -3,6 +3,7 @@ import { parseEdgeEnv } from '@utunnel/config'
 import {
   type HostSessionRecord,
   type HttpRequestMessage,
+  type WebSocketOpenMessage,
   serviceBindingPayloadSchema,
   type RoutingEntry,
   type ServiceBindingPayload,
@@ -130,6 +131,12 @@ type RelayHttpRequest = {
   expectedSessionId: string
   expectedVersion: number
   request: HttpRequestMessage
+}
+
+type RelayWebSocketRequest = {
+  expectedSessionId: string
+  expectedVersion: number
+  request: WebSocketOpenMessage
 }
 
 export const createEdgeApp = () => {
@@ -352,6 +359,32 @@ export const createEdgeApp = () => {
     }
 
     const route = (await resolveRes.json()) as RoutingEntry
+    const hostStub = getHostStub(c.env, route.hostId)
+
+    if (c.req.header('Upgrade')?.toLowerCase() === 'websocket') {
+      const relayRequest: RelayWebSocketRequest = {
+        expectedSessionId: route.sessionId,
+        expectedVersion: route.version,
+        request: {
+          type: 'ws_open',
+          payload: {
+            streamId: crypto.randomUUID(),
+            serviceId: route.serviceId,
+            path: relayPath,
+            headers: buildRelayRequestHeaders(c.req.raw),
+          },
+        },
+      }
+
+      return hostStub.fetch(
+        new Request('https://host.internal/relay-ws', {
+          method: 'POST',
+          headers: c.req.raw.headers,
+          body: JSON.stringify(relayRequest),
+        }),
+      )
+    }
+
     const relayRequest: RelayHttpRequest = {
       expectedSessionId: route.sessionId,
       expectedVersion: route.version,
@@ -368,7 +401,6 @@ export const createEdgeApp = () => {
       },
     }
 
-    const hostStub = getHostStub(c.env, route.hostId)
     return hostStub.fetch(toJsonRequest('https://host.internal/relay-http', relayRequest))
   })
 
