@@ -451,6 +451,100 @@ describe('edge app integration', () => {
     expect(json.reason).toBe('stale_session_binding')
   })
 
+  test('rebinds to a new session and restores traffic with the same hostname', async () => {
+    const env = createEnv()
+    const authHeader = {
+      authorization: `Bearer ${buildHostToken('host-1', env.OPERATOR_TOKEN)}`,
+      'content-type': 'application/json',
+    }
+
+    const initialRegister = await app.request(
+      'http://edge.test/api/hosts/host-1/services',
+      {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({
+          sessionId: 'session-1',
+          version: 1,
+          services: [
+            {
+              serviceId: 'svc-1',
+              serviceName: 'echo',
+              localUrl: 'http://127.0.0.1:3001',
+              protocol: 'http',
+              subdomain: 'echo.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+    expect(initialRegister.status).toBe(200)
+
+    const disconnect = await app.request(
+      'http://edge.test/api/hosts/host-1/disconnect',
+      { method: 'POST', headers: authHeader },
+      env,
+    )
+    expect(disconnect.status).toBe(200)
+
+    const failClosed = await app.request(
+      'http://edge.test/tunnel/status',
+      { headers: { host: 'echo.example.test' } },
+      env,
+    )
+    expect(failClosed.status).toBe(409)
+
+    const rebind = await app.request(
+      'http://edge.test/api/hosts/host-1/rebind',
+      {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({
+          previousSessionId: 'session-1',
+          sessionId: 'session-2',
+          version: 2,
+          services: [
+            {
+              serviceId: 'svc-1',
+              serviceName: 'echo',
+              localUrl: 'http://127.0.0.1:3001',
+              protocol: 'http',
+              subdomain: 'echo.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+    expect(rebind.status).toBe(200)
+
+    const operatorHeader = { authorization: 'Bearer dev-operator-token' }
+    const routes = await app.request('http://edge.test/api/routes', { headers: operatorHeader }, env)
+    const routeJson = (await routes.json()) as RoutingEntry[]
+    expect(routeJson).toHaveLength(1)
+    expect(routeJson[0]?.hostname).toBe('echo.example.test')
+    expect(routeJson[0]?.sessionId).toBe('session-2')
+    expect(routeJson[0]?.version).toBe(2)
+
+    const session = await app.request('http://edge.test/api/hosts/host-1/session', { headers: operatorHeader }, env)
+    const sessionJson = (await session.json()) as SessionRecord
+    expect(sessionJson.sessionId).toBe('session-2')
+    expect(sessionJson.version).toBe(2)
+    expect(sessionJson.disconnectedAt).toBeNull()
+
+    const restored = await app.request(
+      'http://edge.test/tunnel/status?after=rebind',
+      { headers: { host: 'echo.example.test' } },
+      env,
+    )
+    const restoredJson = (await restored.json()) as Record<string, string | null>
+
+    expect(restored.status).toBe(200)
+    expect(restoredJson.path).toBe('/status?after=rebind')
+    expect(restoredJson.serviceId).toBe('svc-1')
+  })
+
   test('rejects rebind when previous session id mismatches', async () => {
     const env = createEnv()
     const authHeader = {
