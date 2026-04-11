@@ -70,6 +70,19 @@ type SessionRecord = {
 
 class FakeHostStub {
   session: SessionRecord | null = null
+  lastRelayHttp: {
+    expectedSessionId: string
+    expectedVersion: number
+    request: {
+      payload: {
+        method: string
+        path: string
+        serviceId: string
+        streamId: string
+        headers: Record<string, string>
+      }
+    }
+  } | null = null
   lastRelayWs: {
     expectedSessionId: string
     expectedVersion: number
@@ -109,6 +122,8 @@ class FakeHostStub {
           }
         }
       }
+
+      this.lastRelayHttp = relay
 
       if (
         !this.session ||
@@ -346,6 +361,74 @@ describe('edge app integration', () => {
     const routesAfter = await app.request('http://edge.test/api/routes', { headers: operatorHeader }, env)
     const afterJson = (await routesAfter.json()) as RoutingEntry[]
     expect(afterJson).toHaveLength(0)
+  })
+
+  test('routes multiple host subdomains to the correct owning host', async () => {
+    const env = createEnv()
+    const registerHost = async (
+      hostId: string,
+      sessionId: string,
+      version: number,
+      serviceId: string,
+      subdomain: string,
+      localUrl: string,
+    ) => {
+      return app.request(
+        `http://edge.test/api/hosts/${hostId}/services`,
+        {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${buildHostToken(hostId, env.OPERATOR_TOKEN)}`,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            sessionId,
+            version,
+            services: [
+              {
+                serviceId,
+                serviceName: serviceId,
+                localUrl,
+                protocol: 'http',
+                subdomain,
+              },
+            ],
+          }),
+        },
+        env,
+      )
+    }
+
+    expect(await registerHost('host-1', 'session-a', 1, 'svc-a', 'alpha.example.test', 'http://127.0.0.1:3001')).toHaveProperty('status', 200)
+    expect(await registerHost('host-2', 'session-b', 1, 'svc-b', 'beta.example.test', 'http://127.0.0.1:3002')).toHaveProperty('status', 200)
+    expect(await registerHost('host-3', 'session-c', 1, 'svc-c', 'gamma.example.test', 'http://127.0.0.1:3003')).toHaveProperty('status', 200)
+
+    const alphaResponse = await app.request('http://edge.test/tunnel/demo?a=1', { headers: { host: 'alpha.example.test' } }, env)
+    const betaResponse = await app.request('http://edge.test/tunnel/demo?b=1', { headers: { host: 'beta.example.test' } }, env)
+    const gammaResponse = await app.request('http://edge.test/tunnel/demo?c=1', { headers: { host: 'gamma.example.test' } }, env)
+
+    const alphaJson = (await alphaResponse.json()) as Record<string, string | null>
+    const betaJson = (await betaResponse.json()) as Record<string, string | null>
+    const gammaJson = (await gammaResponse.json()) as Record<string, string | null>
+
+    expect(alphaResponse.status).toBe(200)
+    expect(betaResponse.status).toBe(200)
+    expect(gammaResponse.status).toBe(200)
+
+    expect(alphaJson.serviceId).toBe('svc-a')
+    expect(betaJson.serviceId).toBe('svc-b')
+    expect(gammaJson.serviceId).toBe('svc-c')
+
+    const host1 = env.HOST_SESSION.get('host-1')
+    const host2 = env.HOST_SESSION.get('host-2')
+    const host3 = env.HOST_SESSION.get('host-3')
+
+    expect(host1.lastRelayHttp?.request.payload.path).toBe('/demo?a=1')
+    expect(host2.lastRelayHttp?.request.payload.path).toBe('/demo?b=1')
+    expect(host3.lastRelayHttp?.request.payload.path).toBe('/demo?c=1')
+    expect(host1.lastRelayHttp?.request.payload.serviceId).toBe('svc-a')
+    expect(host2.lastRelayHttp?.request.payload.serviceId).toBe('svc-b')
+    expect(host3.lastRelayHttp?.request.payload.serviceId).toBe('svc-c')
   })
 
   test('relays public tunnel request to owning host', async () => {
@@ -592,7 +675,50 @@ describe('edge app integration', () => {
     expect(json.reason).toBe('stale_session_binding')
   })
 
+  test('fails closed when host session state is lost while route still exists', async () => {
+    const env = createEnv()
+    const authHeader = {
+      authorization: `Bearer ${buildHostToken('host-1', env.OPERATOR_TOKEN)}`,
+      'content-type': 'application/json',
+    }
+
+    await app.request(
+      'http://edge.test/api/hosts/host-1/services',
+      {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({
+          sessionId: 'session-loss-1',
+          version: 1,
+          services: [
+            {
+              serviceId: 'svc-loss',
+              serviceName: 'echo-loss',
+              localUrl: 'http://127.0.0.1:3004',
+              protocol: 'http',
+              subdomain: 'loss.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+
+    await env.HOST_SESSION.get('host-1').fetch('https://host.internal/clear', { method: 'POST' })
+
+    const response = await app.request(
+      'http://edge.test/tunnel/lost',
+      { headers: { host: 'loss.example.test' } },
+      env,
+    )
+    const json = (await response.json()) as { ok: boolean; reason: string }
+
+    expect(response.status).toBe(409)
+    expect(json).toEqual({ ok: false, reason: 'stale_session_binding' })
+  })
+
   test('rebinds to a new session and restores traffic with the same hostname', async () => {
+
     const env = createEnv()
     const authHeader = {
       authorization: `Bearer ${buildHostToken('host-1', env.OPERATOR_TOKEN)}`,
