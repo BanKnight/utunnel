@@ -1,0 +1,12 @@
+{
+  "name": "@utunnel/agent",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run src/index.ts"
+  },
+  "dependencies": {
+    "@utunnel/config": "workspace:*",
+    "@utunnel/protocol": "workspace:*"
+  }
+}

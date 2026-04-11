@@ -1,0 +1,30 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "utunnel-edge",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-11",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "ROOT_DOMAIN": "example.test",
+    "OPERATOR_TOKEN": "dev-operator-token",
+    "STALE_ROUTE_GRACE_MS": "30000"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ROUTING_DIRECTORY",
+        "class_name": "RoutingDirectory"
+      },
+      {
+        "name": "HOST_SESSION",
+        "class_name": "HostSession"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["RoutingDirectory", "HostSession"]
+    }
+  ]
+}
