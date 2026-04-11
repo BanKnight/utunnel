@@ -2,6 +2,7 @@ import { Hono } from 'hono'
 import { parseEdgeEnv } from '@utunnel/config'
 import {
   type HostSessionRecord,
+  type HttpRequestMessage,
   serviceBindingPayloadSchema,
   type RoutingEntry,
   type ServiceBindingPayload,
@@ -80,6 +81,49 @@ const parseAndValidatePayload = async (request: Request, env: EdgeBindings) => {
     ...rawPayload,
     services,
   } satisfies ServiceBindingPayload
+}
+
+const isBlockedRelayRequestHeader = (name: string) => {
+  const normalized = name.toLowerCase()
+  return (
+    normalized === 'host' ||
+    normalized === 'content-length' ||
+    normalized === 'connection' ||
+    normalized === 'keep-alive' ||
+    normalized === 'transfer-encoding' ||
+    normalized === 'upgrade' ||
+    normalized === 'te' ||
+    normalized === 'trailer' ||
+    normalized === 'forwarded' ||
+    normalized === 'x-real-ip' ||
+    normalized.startsWith('x-forwarded-') ||
+    normalized.startsWith('proxy-')
+  )
+}
+
+const buildRelayRequestHeaders = (request: Request) => {
+  return Object.fromEntries(
+    Array.from(request.headers.entries()).filter(([name]) => !isBlockedRelayRequestHeader(name)),
+  ) satisfies Record<string, string>
+}
+
+const assertRelayPath = (path: string) => {
+  if (!path.startsWith('/') || path.startsWith('//') || path.includes('\\')) {
+    throw new Error('invalid_relay_path')
+  }
+
+  const decodedPath = decodeURIComponent(path)
+  if (decodedPath.startsWith('//')) {
+    throw new Error('invalid_relay_path')
+  }
+}
+
+const buildRelayRequestPath = (requestUrl: string) => {
+  const url = new URL(requestUrl)
+  const relayPath = url.pathname.replace(/^\/tunnel/, '') || '/'
+  const nextPath = `${relayPath}${url.search}`
+  assertRelayPath(nextPath)
+  return nextPath
 }
 
 export const createEdgeApp = () => {
@@ -281,6 +325,19 @@ export const createEdgeApp = () => {
       return c.json({ error: 'host_outside_root_domain' }, 404)
     }
 
+    const relayPath = (() => {
+      try {
+        return buildRelayRequestPath(c.req.url)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'invalid_relay_path'
+        return message
+      }
+    })()
+
+    if (relayPath === 'invalid_relay_path') {
+      return c.json({ error: 'invalid_relay_path' }, 400)
+    }
+
     const routing = getRoutingStub(c.env)
     const resolveRes = await routing.fetch(`https://routing.internal/resolve?hostname=${encodeURIComponent(hostname)}`)
 
@@ -288,12 +345,21 @@ export const createEdgeApp = () => {
       return c.json({ error: 'route_not_found' }, 404)
     }
 
-    return c.json({
-      ok: true,
-      hostname,
-      status: 'route_bound',
-      note: 'Relay plumbing placeholder. HTTP and WebSocket forwarding will be implemented on top of this routing/session model.',
-    })
+    const route = (await resolveRes.json()) as RoutingEntry
+    const relayRequest: HttpRequestMessage = {
+      type: 'http_request',
+      payload: {
+        streamId: crypto.randomUUID(),
+        serviceId: route.serviceId,
+        method: c.req.method,
+        path: relayPath,
+        headers: buildRelayRequestHeaders(c.req.raw),
+        body: ['GET', 'HEAD'].includes(c.req.method.toUpperCase()) ? '' : await c.req.raw.text(),
+      },
+    }
+
+    const hostStub = getHostStub(c.env, route.hostId)
+    return hostStub.fetch(toJsonRequest('https://host.internal/relay-http', relayRequest))
   })
 
   return app

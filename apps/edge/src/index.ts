@@ -1,7 +1,9 @@
 import { DurableObject } from 'cloudflare:workers'
-import type { HostSessionRecord, RoutingEntry } from '@utunnel/protocol'
+import { responseEnvelopeSchema, type HostSessionRecord, type HttpRequestMessage, type HttpResponseMessage, type RoutingEntry } from '@utunnel/protocol'
 import { app, type EdgeBindings } from './app'
 import { markSessionDisconnected } from './lib'
+
+const decoder = new TextDecoder()
 
 export class RoutingDirectory extends DurableObject<EdgeBindings> {
   async fetch(request: Request): Promise<Response> {
@@ -52,9 +54,45 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
 }
 
 export class HostSession extends DurableObject<EdgeBindings> {
+  private pendingResponses = new Map<string, (message: HttpResponseMessage) => void>()
+
   constructor(ctx: DurableObjectState, env: EdgeBindings) {
     super(ctx, env)
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'))
+  }
+
+  private getConnectedSocket() {
+    return this.ctx.getWebSockets()[0]
+  }
+
+  private readMessage(message: string | ArrayBuffer) {
+    return typeof message === 'string' ? message : decoder.decode(message)
+  }
+
+  private async relayHttpRequest(payload: HttpRequestMessage) {
+    const socket = this.getConnectedSocket()
+    if (!socket) {
+      return Response.json({ ok: false, reason: 'host_not_connected' }, { status: 503 })
+    }
+
+    const responseMessage = await new Promise<HttpResponseMessage>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingResponses.delete(payload.payload.streamId)
+        reject(new Error('relay_timeout'))
+      }, 5_000)
+
+      this.pendingResponses.set(payload.payload.streamId, (message) => {
+        clearTimeout(timeout)
+        resolve(message)
+      })
+
+      socket.send(JSON.stringify(payload))
+    })
+
+    return new Response(responseMessage.payload.body, {
+      status: responseMessage.payload.status,
+      headers: responseMessage.payload.headers,
+    })
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -76,6 +114,10 @@ export class HostSession extends DurableObject<EdgeBindings> {
       }
       await this.ctx.storage.put('session', payload)
       return Response.json(payload)
+    }
+
+    if (request.method === 'POST' && url.pathname === '/relay-http') {
+      return this.relayHttpRequest((await request.json()) as HttpRequestMessage)
     }
 
     if (request.method === 'POST' && url.pathname === '/disconnect') {
@@ -102,9 +144,26 @@ export class HostSession extends DurableObject<EdgeBindings> {
     return Response.json({ error: 'not_found' }, { status: 404 })
   }
 
-  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    const text = typeof message === 'string' ? message : new TextDecoder().decode(message)
-    ws.send(text)
+  async webSocketMessage(_ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    const text = this.readMessage(message)
+    if (text === 'ping' || text === 'pong') {
+      return
+    }
+
+    let parsed: HttpResponseMessage
+    try {
+      parsed = responseEnvelopeSchema.parse(JSON.parse(text))
+    } catch {
+      return
+    }
+
+    const resolve = this.pendingResponses.get(parsed.payload.streamId)
+    if (!resolve) {
+      return
+    }
+
+    this.pendingResponses.delete(parsed.payload.streamId)
+    resolve(parsed)
   }
 }
 

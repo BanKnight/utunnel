@@ -136,6 +136,8 @@ export type HostIdentity = z.infer<typeof hostIdentitySchema>
 export type ServiceDefinition = z.infer<typeof serviceDefinitionSchema>
 export type ServiceBindingPayload = z.infer<typeof serviceBindingPayloadSchema>
 export type HostSessionRecord = z.infer<typeof hostSessionRecordSchema>
+export type HttpRequestMessage = z.infer<typeof requestEnvelopeSchema>
+export type HttpResponseMessage = z.infer<typeof responseEnvelopeSchema>
 export type TunnelMessage = z.infer<typeof tunnelMessageSchema>
 
 export type RoutingEntry = {

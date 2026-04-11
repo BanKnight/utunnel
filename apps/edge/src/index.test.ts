@@ -84,6 +84,37 @@ class FakeHostStub {
       return Response.json(this.session)
     }
 
+    if (request.method === 'POST' && url.pathname === '/relay-http') {
+      const relay = (await request.json()) as {
+        payload: {
+          method: string
+          path: string
+          serviceId: string
+          streamId: string
+          headers: Record<string, string>
+        }
+      }
+
+      return Response.json(
+        {
+          ok: true,
+          serviceId: relay.payload.serviceId,
+          path: relay.payload.path,
+          method: relay.payload.method,
+          streamId: relay.payload.streamId,
+          forwardedHostHeader: relay.payload.headers.host ?? null,
+          forwardedXffHeader: relay.payload.headers['x-forwarded-for'] ?? null,
+          forwardedPortHeader: relay.payload.headers['x-forwarded-port'] ?? null,
+          proxyAuthorizationHeader: relay.payload.headers['proxy-authorization'] ?? null,
+        },
+        {
+          headers: {
+            'x-utunnel-relay': 'fake-host',
+          },
+        },
+      )
+    }
+
     if (request.method === 'POST' && url.pathname === '/disconnect') {
       if (!this.session) {
         return Response.json({ error: 'session_not_found' }, { status: 404 })
@@ -266,7 +297,7 @@ describe('edge app integration', () => {
     expect(afterJson).toHaveLength(0)
   })
 
-  test('does not expose route metadata on public tunnel route', async () => {
+  test('relays public tunnel request to owning host', async () => {
     const env = createEnv()
     const authHeader = {
       authorization: `Bearer ${buildHostToken('host-1', env.OPERATOR_TOKEN)}`,
@@ -296,15 +327,68 @@ describe('edge app integration', () => {
     )
 
     const response = await app.request(
-      'http://edge.test/tunnel/status',
+      'http://edge.test/tunnel/status?check=1',
+      {
+        headers: {
+          host: 'echo.example.test',
+          'x-forwarded-for': '1.2.3.4',
+          'x-forwarded-port': '443',
+          'proxy-authorization': 'Basic abc',
+        },
+      },
+      env,
+    )
+    const json = (await response.json()) as Record<string, string | null>
+
+    expect(response.status).toBe(200)
+    expect(response.headers.get('x-utunnel-relay')).toBe('fake-host')
+    expect(json.serviceId).toBe('svc-1')
+    expect(json.path).toBe('/status?check=1')
+    expect(json.method).toBe('GET')
+    expect(json.forwardedHostHeader).toBeNull()
+    expect(json.forwardedXffHeader).toBeNull()
+    expect(json.forwardedPortHeader).toBeNull()
+    expect(json.proxyAuthorizationHeader).toBeNull()
+  })
+
+  test('rejects invalid relay path before forwarding', async () => {
+    const env = createEnv()
+    const authHeader = {
+      authorization: `Bearer ${buildHostToken('host-1', env.OPERATOR_TOKEN)}`,
+      'content-type': 'application/json',
+    }
+
+    await app.request(
+      'http://edge.test/api/hosts/host-1/services',
+      {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({
+          sessionId: 'session-1',
+          version: 1,
+          services: [
+            {
+              serviceId: 'svc-1',
+              serviceName: 'echo',
+              localUrl: 'http://127.0.0.1:3001',
+              protocol: 'http',
+              subdomain: 'echo.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+
+    const response = await app.request(
+      'http://edge.test/tunnel//169.254.169.254/latest',
       { headers: { host: 'echo.example.test' } },
       env,
     )
-    const json = (await response.json()) as Record<string, unknown>
 
-    expect(response.status).toBe(200)
-    expect(json.route).toBeUndefined()
-    expect(json.status).toBe('route_bound')
+    expect(response.status).toBe(400)
+    const json = (await response.json()) as { error: string }
+    expect(json).toEqual({ error: 'invalid_relay_path' })
   })
 
   test('rejects rebind when previous session id mismatches', async () => {

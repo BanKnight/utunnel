@@ -1,6 +1,7 @@
 import { parseAgentConfig } from '@utunnel/config'
 import type { AgentConfig } from '@utunnel/config'
-import type { ServiceDefinition } from '@utunnel/protocol'
+import type { HttpRequestMessage, HttpResponseMessage, ServiceDefinition, TunnelMessage } from '@utunnel/protocol'
+import { requestEnvelopeSchema } from '@utunnel/protocol'
 import {
   buildServiceBindingPayload,
   createDefaultAgentConfig,
@@ -88,9 +89,107 @@ const startHeartbeat = (socket: WebSocket) => {
   }, 10_000)
 }
 
+const findServiceById = (services: ServiceDefinition[], serviceId: string) => {
+  return services.find((service) => service.serviceId === serviceId)
+}
+
+const buildUpstreamUrl = (service: ServiceDefinition, relayPath: string) => {
+  if (!relayPath.startsWith('/') || relayPath.startsWith('//') || relayPath.includes('\\')) {
+    throw new Error('invalid_relay_path')
+  }
+
+  const relayUrl = new URL(`http://relay.internal${relayPath}`)
+  const upstreamUrl = new URL(service.localUrl)
+  upstreamUrl.pathname = relayUrl.pathname
+  upstreamUrl.search = relayUrl.search
+  return upstreamUrl
+}
+
+export const forwardHttpRequest = async (
+  services: ServiceDefinition[],
+  message: HttpRequestMessage,
+): Promise<HttpResponseMessage> => {
+  const service = findServiceById(services, message.payload.serviceId)
+
+  if (!service) {
+    return {
+      type: 'http_response',
+      payload: {
+        streamId: message.payload.streamId,
+        status: 404,
+        headers: {
+          'content-type': 'text/plain; charset=utf-8',
+        },
+        body: 'service_not_found',
+      },
+    }
+  }
+
+  let upstreamUrl: URL
+  try {
+    upstreamUrl = buildUpstreamUrl(service, message.payload.path)
+  } catch {
+    return {
+      type: 'http_response',
+      payload: {
+        streamId: message.payload.streamId,
+        status: 400,
+        headers: {
+          'content-type': 'text/plain; charset=utf-8',
+        },
+        body: 'invalid_relay_path',
+      },
+    }
+  }
+
+  const upstreamResponse = await fetch(upstreamUrl, {
+    method: message.payload.method,
+    headers: message.payload.headers,
+    ...(['GET', 'HEAD'].includes(message.payload.method.toUpperCase())
+      ? {}
+      : { body: message.payload.body }),
+  })
+
+  const responseHeaders = Object.fromEntries(upstreamResponse.headers.entries())
+  const responseBody = await upstreamResponse.text()
+
+  return {
+    type: 'http_response',
+    payload: {
+      streamId: message.payload.streamId,
+      status: upstreamResponse.status,
+      headers: responseHeaders,
+      body: responseBody,
+    },
+  }
+}
+
+const attachRelayHandlers = (socket: WebSocket, services: ServiceDefinition[]) => {
+  socket.addEventListener('message', async (event) => {
+    if (typeof event.data !== 'string' || event.data === 'pong' || event.data === 'ping') {
+      return
+    }
+
+    let parsed: TunnelMessage
+    try {
+      parsed = requestEnvelopeSchema.parse(JSON.parse(event.data))
+    } catch {
+      return
+    }
+
+    if (parsed.type !== 'http_request') {
+      return
+    }
+
+    const response = await forwardHttpRequest(services, parsed)
+    socket.send(JSON.stringify(response))
+  })
+}
+
 const runAgentCycle = async (config: AgentConfig, state: RuntimeState) => {
   await verifyHostToken(config)
   const socket = await connectHostSession(config.edgeBaseUrl, config.hostId, config.token)
+  attachRelayHandlers(socket, config.services)
   const heartbeat = startHeartbeat(socket)
   const registration = await registerServices(config.edgeBaseUrl, config.hostId, state, config.services, config.token)
 
@@ -159,7 +258,9 @@ const main = async () => {
   await runAgent(config)
 }
 
-main().catch((error) => {
-  console.error(error)
-  process.exit(1)
-})
+if (import.meta.main) {
+  main().catch((error) => {
+    console.error(error)
+    process.exit(1)
+  })
+}
