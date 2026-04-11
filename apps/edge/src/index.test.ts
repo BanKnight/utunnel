@@ -70,6 +70,19 @@ type SessionRecord = {
 
 class FakeHostStub {
   session: SessionRecord | null = null
+  relayHttpHistory: Array<{
+    expectedSessionId: string
+    expectedVersion: number
+    request: {
+      payload: {
+        method: string
+        path: string
+        serviceId: string
+        streamId: string
+        headers: Record<string, string>
+      }
+    }
+  }> = []
   lastRelayHttp: {
     expectedSessionId: string
     expectedVersion: number
@@ -124,6 +137,7 @@ class FakeHostStub {
       }
 
       this.lastRelayHttp = relay
+      this.relayHttpHistory.push(relay)
 
       if (
         !this.session ||
@@ -361,6 +375,61 @@ describe('edge app integration', () => {
     const routesAfter = await app.request('http://edge.test/api/routes', { headers: operatorHeader }, env)
     const afterJson = (await routesAfter.json()) as RoutingEntry[]
     expect(afterJson).toHaveLength(0)
+  })
+
+  test('routes multiple services on the same host without cross-wiring', async () => {
+    const env = createEnv()
+    const authHeader = {
+      authorization: `Bearer ${buildHostToken('host-1', env.OPERATOR_TOKEN)}`,
+      'content-type': 'application/json',
+    }
+
+    const register = await app.request(
+      'http://edge.test/api/hosts/host-1/services',
+      {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({
+          sessionId: 'session-multi-1',
+          version: 1,
+          services: [
+            {
+              serviceId: 'svc-one',
+              serviceName: 'one',
+              localUrl: 'http://127.0.0.1:3101',
+              protocol: 'http',
+              subdomain: 'one.example.test',
+            },
+            {
+              serviceId: 'svc-two',
+              serviceName: 'two',
+              localUrl: 'http://127.0.0.1:3102',
+              protocol: 'http',
+              subdomain: 'two.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+    expect(register.status).toBe(200)
+
+    const [oneResponse, twoResponse] = await Promise.all([
+      app.request('http://edge.test/tunnel/one?x=1', { headers: { host: 'one.example.test' } }, env),
+      app.request('http://edge.test/tunnel/two?y=1', { headers: { host: 'two.example.test' } }, env),
+    ])
+
+    const oneJson = (await oneResponse.json()) as Record<string, string | null>
+    const twoJson = (await twoResponse.json()) as Record<string, string | null>
+    const host = env.HOST_SESSION.get('host-1')
+
+    expect(oneResponse.status).toBe(200)
+    expect(twoResponse.status).toBe(200)
+    expect(oneJson.serviceId).toBe('svc-one')
+    expect(twoJson.serviceId).toBe('svc-two')
+    expect(host.relayHttpHistory).toHaveLength(2)
+    expect(host.relayHttpHistory.map((entry) => entry.request.payload.serviceId).sort()).toEqual(['svc-one', 'svc-two'])
+    expect(host.relayHttpHistory.map((entry) => entry.request.payload.path).sort()).toEqual(['/one?x=1', '/two?y=1'])
   })
 
   test('routes multiple host subdomains to the correct owning host', async () => {

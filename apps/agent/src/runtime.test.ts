@@ -196,6 +196,87 @@ describe('agent runtime helpers', () => {
     expect(upstreamSocket.closed).toEqual([{ code: 1000, reason: 'done' }])
   })
 
+  test('keeps websocket streams isolated on the same host', async () => {
+    const relayState = createRelayState()
+    const edgeMessages: string[] = []
+    const upstreamA = new FakeUpstreamSocket()
+    const upstreamB = new FakeUpstreamSocket()
+    let socketIndex = 0
+
+    const services = [
+      {
+        serviceId: 'svc-ws-a',
+        serviceName: 'echo-ws-a',
+        localUrl: 'http://127.0.0.1:3201',
+        protocol: 'websocket' as const,
+        subdomain: 'a.example.test',
+      },
+      {
+        serviceId: 'svc-ws-b',
+        serviceName: 'echo-ws-b',
+        localUrl: 'http://127.0.0.1:3202',
+        protocol: 'websocket' as const,
+        subdomain: 'b.example.test',
+      },
+    ]
+
+    await handleTunnelMessage(
+      {
+        type: 'ws_open',
+        payload: {
+          streamId: 'stream-a',
+          serviceId: 'svc-ws-a',
+          path: '/a',
+          headers: {},
+        },
+      },
+      services,
+      relayState,
+      { send: (data: string) => edgeMessages.push(data) },
+      () => (socketIndex++ === 0 ? upstreamA : upstreamB),
+    )
+
+    await handleTunnelMessage(
+      {
+        type: 'ws_open',
+        payload: {
+          streamId: 'stream-b',
+          serviceId: 'svc-ws-b',
+          path: '/b',
+          headers: {},
+        },
+      },
+      services,
+      relayState,
+      { send: (data: string) => edgeMessages.push(data) },
+      () => (socketIndex++ === 0 ? upstreamA : upstreamB),
+    )
+
+    await handleTunnelMessage(
+      { type: 'ws_frame', payload: { streamId: 'stream-a', data: 'alpha' } },
+      services,
+      relayState,
+      { send: () => {} },
+    )
+    await handleTunnelMessage(
+      { type: 'ws_frame', payload: { streamId: 'stream-b', data: 'beta' } },
+      services,
+      relayState,
+      { send: () => {} },
+    )
+
+    expect(upstreamA.sent).toEqual(['alpha'])
+    expect(upstreamB.sent).toEqual(['beta'])
+
+    upstreamA.emit('message', { data: 'from-a' })
+    upstreamB.emit('message', { data: 'from-b' })
+
+    expect(edgeMessages.map((item) => JSON.parse(item))).toEqual([
+      { type: 'ws_frame', payload: { streamId: 'stream-a', data: 'from-a' } },
+      { type: 'ws_frame', payload: { streamId: 'stream-b', data: 'from-b' } },
+    ])
+  })
+
   test('closes websocket when service is missing', async () => {
     const relayState = createRelayState()
     const edgeMessages: string[] = []
