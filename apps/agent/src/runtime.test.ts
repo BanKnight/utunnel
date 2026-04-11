@@ -195,5 +195,72 @@ describe('agent runtime helpers', () => {
     await handleTunnelMessage(closeFromEdge, [], relayState, { send: () => {} })
     expect(upstreamSocket.closed).toEqual([{ code: 1000, reason: 'done' }])
   })
+
+  test('closes websocket when service is missing', async () => {
+    const relayState = createRelayState()
+    const edgeMessages: string[] = []
+    const openMessage: WebSocketOpenMessage = {
+      type: 'ws_open',
+      payload: {
+        streamId: 'ws-missing',
+        serviceId: 'svc-missing',
+        path: '/socket',
+        headers: {},
+      },
+    }
+
+    await handleTunnelMessage(openMessage, [], relayState, { send: (data: string) => edgeMessages.push(data) })
+
+    expect(edgeMessages).toHaveLength(1)
+    expect(JSON.parse(edgeMessages[0]!)).toEqual({
+      type: 'ws_close',
+      payload: {
+        streamId: 'ws-missing',
+        code: 1011,
+        reason: 'service_not_found',
+      },
+    })
+  })
+
+  test('closes websocket on invalid relay path', async () => {
+    const relayState = createRelayState()
+    const edgeMessages: string[] = []
+    const openMessage: WebSocketOpenMessage = {
+      type: 'ws_open',
+      payload: {
+        streamId: 'ws-invalid',
+        serviceId: 'svc-ws',
+        path: '//bad-host/socket',
+        headers: {},
+      },
+    }
+
+    await handleTunnelMessage(
+      openMessage,
+      [
+        {
+          serviceId: 'svc-ws',
+          serviceName: 'echo-ws',
+          localUrl: 'http://127.0.0.1:3001',
+          protocol: 'websocket',
+          subdomain: 'ws.example.test',
+        },
+      ],
+      relayState,
+      { send: (data: string) => edgeMessages.push(data) },
+      () => new FakeUpstreamSocket(),
+    )
+
+    expect(edgeMessages).toHaveLength(1)
+    expect(JSON.parse(edgeMessages[0]!)).toEqual({
+      type: 'ws_close',
+      payload: {
+        streamId: 'ws-invalid',
+        code: 1008,
+        reason: 'invalid_relay_path',
+      },
+    })
+  })
 })
+
 

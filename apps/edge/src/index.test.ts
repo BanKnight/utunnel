@@ -70,6 +70,17 @@ type SessionRecord = {
 
 class FakeHostStub {
   session: SessionRecord | null = null
+  lastRelayWs: {
+    expectedSessionId: string
+    expectedVersion: number
+    request: {
+      payload: {
+        serviceId: string
+        streamId: string
+        path: string
+      }
+    }
+  } | null = null
 
   async fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
     const request = input instanceof Request ? input : new Request(input, init)
@@ -140,6 +151,8 @@ class FakeHostStub {
           }
         }
       }
+
+      this.lastRelayWs = relay
 
       if (
         !this.session ||
@@ -430,7 +443,66 @@ describe('edge app integration', () => {
       env,
     )
 
+    const hostStub = env.HOST_SESSION.get('host-1')
+
     expect(response.status).toBe(101)
+    expect(hostStub.lastRelayWs?.expectedSessionId).toBe('session-ws-1')
+    expect(hostStub.lastRelayWs?.expectedVersion).toBe(1)
+    expect(hostStub.lastRelayWs?.request.payload.serviceId).toBe('svc-ws')
+    expect(hostStub.lastRelayWs?.request.payload.path).toBe('/socket?channel=1')
+  })
+
+  test('websocket upgrade fails closed when route points to a disconnected session', async () => {
+    const env = createEnv()
+    const authHeader = {
+      authorization: `Bearer ${buildHostToken('host-1', env.OPERATOR_TOKEN)}`,
+      'content-type': 'application/json',
+    }
+
+    await app.request(
+      'http://edge.test/api/hosts/host-1/services',
+      {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({
+          sessionId: 'session-ws-stale',
+          version: 1,
+          services: [
+            {
+              serviceId: 'svc-ws-stale',
+              serviceName: 'echo-ws-stale',
+              localUrl: 'http://127.0.0.1:3003',
+              protocol: 'websocket',
+              subdomain: 'stale-ws.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+
+    const disconnect = await app.request(
+      'http://edge.test/api/hosts/host-1/disconnect',
+      { method: 'POST', headers: authHeader },
+      env,
+    )
+    expect(disconnect.status).toBe(200)
+
+    const response = await app.request(
+      'http://edge.test/tunnel/socket',
+      {
+        method: 'GET',
+        headers: {
+          host: 'stale-ws.example.test',
+          upgrade: 'websocket',
+        },
+      },
+      env,
+    )
+
+    expect(response.status).toBe(409)
+    const json = (await response.json()) as { ok: boolean; reason: string }
+    expect(json).toEqual({ ok: false, reason: 'stale_session_binding' })
   })
 
   test('rejects invalid relay path before forwarding', async () => {
