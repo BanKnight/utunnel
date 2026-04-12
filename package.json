@@ -10,7 +10,7 @@
     "dev:agent": "bun --cwd apps/agent run dev",
     "demo:v1": "bun run smoke:v1",
     "smoke:v1": "bun run packages/testkit/src/v1-smoke.ts",
-    "typecheck": "tsc --noEmit -p packages/protocol/tsconfig.json && tsc --noEmit -p packages/config/tsconfig.json && tsc --noEmit -p packages/testkit/tsconfig.json && tsc --noEmit -p apps/edge/tsconfig.json && tsc --noEmit -p apps/agent/tsconfig.json && tsc --noEmit -p apps/web/tsconfig.json",
+    "typecheck": "bun x tsc --noEmit -p packages/protocol/tsconfig.json && bun x tsc --noEmit -p packages/config/tsconfig.json && bun x tsc --noEmit -p packages/testkit/tsconfig.json && bun x tsc --noEmit -p apps/edge/tsconfig.json && bun x tsc --noEmit -p apps/agent/tsconfig.json && bun x tsc --noEmit -p apps/web/tsconfig.json",
     "test": "bun test ./packages ./apps",
     "check": "bun run typecheck && bun run test"
   },

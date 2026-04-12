@@ -6,17 +6,26 @@ export const edgeEnvSchema = z.object({
   OPERATOR_TOKEN: z.string().min(1),
   STALE_ROUTE_GRACE_MS: z.coerce.number().int().positive().default(30000),
   HEARTBEAT_GRACE_MS: z.coerce.number().int().positive().default(15000),
+  UI_PASSWORD: z.string().min(1).optional(),
+  SESSION_SECRET: z.string().min(1).optional(),
+  SESSION_TTL_MS: z.coerce.number().int().positive().optional(),
 })
 
-export const agentConfigSchema = z.object({
-  hostId: z.string().min(1),
-  hostname: z.string().min(1),
-  token: z.string().min(1),
-  edgeBaseUrl: z.string().url(),
-  reconnectDelayMs: z.number().int().positive().default(3000),
-  maxReconnectAttempts: z.number().int().positive().default(5),
-  services: z.array(serviceDefinitionSchema).default([]),
-})
+export const agentConfigSchema = z
+  .object({
+    hostId: z.string().min(1),
+    hostname: z.string().min(1),
+    token: z.string().min(1).optional(),
+    bootstrapToken: z.string().min(1).optional(),
+    edgeBaseUrl: z.string().url(),
+    reconnectDelayMs: z.number().int().positive().default(3000),
+    maxReconnectAttempts: z.number().int().positive().default(5),
+    services: z.array(serviceDefinitionSchema).default([]),
+  })
+  .refine((value) => Boolean(value.token ?? value.bootstrapToken), {
+    message: 'token_or_bootstrap_token_required',
+    path: ['token'],
+  })
 
 export type EdgeEnvConfig = z.infer<typeof edgeEnvSchema>
 export type AgentConfig = z.infer<typeof agentConfigSchema>

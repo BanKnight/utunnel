@@ -1,8 +1,10 @@
 import { Hono, type Context } from 'hono'
+import { z } from 'zod'
 import { parseEdgeEnv } from '@utunnel/config'
 import {
   type HostSessionRecord,
   type HttpRequestMessage,
+  serviceDefinitionSchema,
   type WebSocketOpenMessage,
   serviceBindingPayloadSchema,
   type RoutingEntry,
@@ -21,26 +23,22 @@ import {
   normalizeServiceDefinitions,
   shouldCleanupStaleRoute,
 } from './lib'
-
-export type FetchStub = {
-  fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>
-}
-
-export type NamespaceLike<T extends FetchStub> = {
-  idFromName(name: string): string
-  get(id: string): T
-}
-
-export type EdgeBindings = {
-  ROOT_DOMAIN: string
-  OPERATOR_TOKEN: string
-  STALE_ROUTE_GRACE_MS: string
-  HEARTBEAT_GRACE_MS: string
-  ROUTING_DIRECTORY: NamespaceLike<FetchStub>
-  HOST_SESSION: NamespaceLike<FetchStub>
-}
-
-type HonoEnv = { Bindings: EdgeBindings }
+import {
+  getAuthenticatedControlShellUser,
+  loginControlShell,
+  logoutControlShell,
+  summarizeDashboard,
+} from './control-shell'
+import {
+  deleteHostControlState,
+  listAppliedRouteProjections,
+  listControlPlaneHosts,
+  promoteAppliedHostConfig,
+  reportCurrentHostConfig,
+  upsertDesiredHostServices,
+} from './control-plane'
+import { attachTrpc } from './trpc-handler'
+import type { EdgeBindings, FetchStub, HonoEnv } from './types'
 
 const toJsonRequest = (url: string, body: unknown, method = 'POST') => {
   return new Request(url, {
@@ -85,6 +83,20 @@ const parseAndValidatePayload = async (request: Request, env: EdgeBindings) => {
     ...rawPayload,
     services,
   } satisfies ServiceBindingPayload
+}
+
+const parseDesiredServicesInput = async (request: Request, env: EdgeBindings) => {
+  const body = (await request.json().catch(() => null)) as { services?: unknown } | null
+  const services = z.array(serviceDefinitionSchema).parse(body?.services ?? [])
+  const normalizedServices = normalizeServiceDefinitions(services)
+
+  for (const service of normalizedServices) {
+    if (!isHostnameInRootDomain(service.subdomain, env.ROOT_DOMAIN)) {
+      throw new Error(`service_outside_root_domain:${service.subdomain}`)
+    }
+  }
+
+  return normalizedServices
 }
 
 const pruneRemovedHostRoutes = async (routing: FetchStub, hostId: string, keepHostnames: string[]) => {
@@ -273,7 +285,153 @@ export const handleTunnelRequest = async (request: Request, env: EdgeBindings) =
 export const createEdgeApp = () => {
   const app = new Hono<HonoEnv>()
 
+  attachTrpc(app)
+
   app.get('/', (c) => c.json({ name: 'utunnel-edge', status: 'ok' }))
+
+  app.post('/api/auth/login', async (c) => {
+    const body = (await c.req.json().catch(() => null)) as { password?: string } | null
+    const result = await loginControlShell(c.env, body?.password ?? '')
+    if (!result.ok) {
+      if (result.reason === 'control_shell_not_configured') {
+        return Response.json({ ok: false, reason: result.reason }, { status: 404 })
+      }
+      return unauthorized(result.reason)
+    }
+
+    c.header('set-cookie', result.setCookie)
+    return c.json({ ok: true, user: result.user })
+  })
+
+  app.get('/api/auth/me', async (c) => {
+    const user = await getAuthenticatedControlShellUser(c.req.raw, c.env)
+    if (!user) {
+      return unauthorized('invalid_session')
+    }
+
+    return c.json({ ok: true, user })
+  })
+
+  app.post('/api/auth/logout', async (c) => {
+    const result = logoutControlShell(c.env)
+    if (!result.ok) {
+      return Response.json({ ok: false, reason: result.reason }, { status: 404 })
+    }
+
+    c.header('set-cookie', result.setCookie)
+    return c.json({ ok: true })
+  })
+
+  app.get('/api/dashboard/summary', async (c) => {
+    const user = await getAuthenticatedControlShellUser(c.req.raw, c.env)
+    if (!user) {
+      return unauthorized('invalid_session')
+    }
+
+    return c.json(await summarizeDashboard(c.env))
+  })
+
+  app.post('/api/control/hosts/:hostId/desired', async (c) => {
+    if (!requireOperatorAuthorization(c.req.raw, c.env)) {
+      return unauthorized('invalid_operator_token')
+    }
+
+    const hostId = c.req.param('hostId')
+    try {
+      const services = await parseDesiredServicesInput(c.req.raw, c.env)
+      const result = await upsertDesiredHostServices(c.env, hostId, services)
+      if (!result.ok) {
+        return Response.json({ ok: false, reason: result.reason }, { status: result.status })
+      }
+      return c.json(result.value)
+    } catch (error) {
+      return badRequest(error instanceof Error ? error.message : 'invalid_desired_payload')
+    }
+  })
+
+  app.post('/api/control/hosts/:hostId/current', async (c) => {
+    if (!requireOperatorAuthorization(c.req.raw, c.env)) {
+      return unauthorized('invalid_operator_token')
+    }
+
+    const hostId = c.req.param('hostId')
+    try {
+      const body = (await c.req.json()) as {
+        generation?: number
+        status?: 'pending' | 'acknowledged' | 'error'
+        services?: unknown
+        error?: string
+      }
+      const services = z.array(serviceDefinitionSchema).parse(body.services ?? [])
+      const result = await reportCurrentHostConfig(c.env, hostId, {
+        generation: z.number().int().positive().parse(body.generation),
+        status: z.enum(['pending', 'acknowledged', 'error']).parse(body.status),
+        services,
+        error: body.error,
+      })
+      if (!result.ok) {
+        return Response.json({ ok: false, reason: result.reason }, { status: result.status })
+      }
+      return c.json(result.value)
+    } catch (error) {
+      return badRequest(error instanceof Error ? error.message : 'invalid_current_payload')
+    }
+  })
+
+  app.post('/api/control/hosts/:hostId/applied', async (c) => {
+    if (!requireOperatorAuthorization(c.req.raw, c.env)) {
+      return unauthorized('invalid_operator_token')
+    }
+
+    const hostId = c.req.param('hostId')
+    try {
+      const body = (await c.req.json()) as {
+        generation?: number
+        services?: unknown
+      }
+      const services = z.array(serviceDefinitionSchema).parse(body.services ?? [])
+      const result = await promoteAppliedHostConfig(c.env, hostId, {
+        generation: z.number().int().positive().parse(body.generation),
+        services,
+      })
+      if (!result.ok) {
+        return Response.json({ ok: false, reason: result.reason }, { status: result.status })
+      }
+      return c.json(result.value)
+    } catch (error) {
+      return badRequest(error instanceof Error ? error.message : 'invalid_applied_payload')
+    }
+  })
+
+  app.get('/api/control/hosts', async (c) => {
+    if (!requireOperatorAuthorization(c.req.raw, c.env)) {
+      return unauthorized('invalid_operator_token')
+    }
+
+    return c.json(await listControlPlaneHosts(c.env))
+  })
+
+  app.delete('/api/control/hosts/:hostId', async (c) => {
+    if (!requireOperatorAuthorization(c.req.raw, c.env)) {
+      return unauthorized('invalid_operator_token')
+    }
+
+    const result = await deleteHostControlState(c.env, c.req.param('hostId'))
+    if (!result.ok) {
+      return Response.json({ ok: false, reason: result.reason }, { status: result.status })
+    }
+
+    return c.json(result.value)
+  })
+
+
+  app.get('/api/control/routes', async (c) => {
+    if (!requireOperatorAuthorization(c.req.raw, c.env)) {
+      return unauthorized('invalid_operator_token')
+    }
+
+    return c.json(await listAppliedRouteProjections(c.env))
+  })
 
   app.post('/api/hosts/:hostId/token/verify', async (c) => {
     const hostId = c.req.param('hostId')
@@ -512,7 +670,6 @@ export const createEdgeApp = () => {
   app.get('/tunnel/__utunnel_host/:hostname/socket', tunnelHandler)
   app.get('/tunnel/*', tunnelHandler)
   app.all('/tunnel/*', tunnelHandler)
-
 
   return app
 }

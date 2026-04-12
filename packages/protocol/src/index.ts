@@ -35,6 +35,73 @@ export const hostSessionRecordSchema = z.object({
   disconnectedAt: z.number().int().nonnegative().nullable().default(null),
 })
 
+export const desiredHostConfigSchema = z.object({
+  hostId: z.string().min(1),
+  generation: z.number().int().positive(),
+  services: z.array(serviceDefinitionSchema),
+  updatedAt: z.number().int().nonnegative(),
+})
+
+export const currentHostConfigSchema = z.object({
+  hostId: z.string().min(1),
+  generation: z.number().int().positive(),
+  status: z.enum(['pending', 'acknowledged', 'error']),
+  reportedAt: z.number().int().nonnegative(),
+  services: z.array(serviceDefinitionSchema),
+  error: z.string().min(1).optional(),
+})
+
+export const appliedHostConfigSchema = z.object({
+  hostId: z.string().min(1),
+  generation: z.number().int().positive(),
+  appliedAt: z.number().int().nonnegative(),
+  services: z.array(serviceDefinitionSchema),
+})
+
+export const bootstrapClaimMessageSchema = z.object({
+  type: z.literal('bootstrap_claim'),
+  payload: hostIdentitySchema.extend({
+    bootstrapToken: z.string().min(1),
+  }),
+})
+
+export const configDispatchMessageSchema = z.object({
+  type: z.literal('config_dispatch'),
+  payload: z.object({
+    hostId: z.string().min(1),
+    generation: z.number().int().positive(),
+    desired: desiredHostConfigSchema,
+    dispatchedAt: z.number().int().nonnegative(),
+    idempotencyKey: z.string().min(1),
+  }),
+})
+
+export const configDispatchStatusBaseSchema = z.object({
+  generation: z.number().int().positive(),
+  status: z.enum(['acknowledged', 'applied', 'error']),
+  acknowledgedAt: z.number().int().nonnegative(),
+  error: z.string().min(1).optional(),
+})
+
+export const configDispatchStatusSchema = configDispatchStatusBaseSchema.refine(
+  (value) => value.status !== 'error' || Boolean(value.error),
+  {
+    message: 'error_reason_required',
+    path: ['error'],
+  },
+)
+
+export const reconcileAckMessageSchema = z.object({
+  type: z.literal('reconcile_ack'),
+  payload: configDispatchStatusBaseSchema.extend({
+    hostId: z.string().min(1),
+  }).refine((value) => value.status !== 'error' || Boolean(value.error), {
+    message: 'error_reason_required',
+    path: ['error'],
+  }),
+})
+
+
 export const registerHostMessageSchema = z.object({
   type: z.literal('register_host'),
   payload: hostIdentitySchema.extend({
@@ -133,16 +200,27 @@ export const tunnelMessageSchema = z.discriminatedUnion('type', [
   rebindServicesMessageSchema,
 ])
 
+export const controlPlaneMessageSchema = z.discriminatedUnion('type', [
+  bootstrapClaimMessageSchema,
+  configDispatchMessageSchema,
+  reconcileAckMessageSchema,
+])
+
 export type HostIdentity = z.infer<typeof hostIdentitySchema>
 export type ServiceDefinition = z.infer<typeof serviceDefinitionSchema>
 export type ServiceBindingPayload = z.infer<typeof serviceBindingPayloadSchema>
 export type HostSessionRecord = z.infer<typeof hostSessionRecordSchema>
+export type DesiredHostConfig = z.infer<typeof desiredHostConfigSchema>
+export type CurrentHostConfig = z.infer<typeof currentHostConfigSchema>
+export type AppliedHostConfig = z.infer<typeof appliedHostConfigSchema>
+export type ConfigDispatchStatus = z.infer<typeof configDispatchStatusSchema>
 export type HttpRequestMessage = z.infer<typeof requestEnvelopeSchema>
 export type HttpResponseMessage = z.infer<typeof responseEnvelopeSchema>
 export type WebSocketOpenMessage = z.infer<typeof websocketOpenSchema>
 export type WebSocketFrameMessage = z.infer<typeof websocketFrameSchema>
 export type WebSocketCloseMessage = z.infer<typeof websocketCloseSchema>
 export type TunnelMessage = z.infer<typeof tunnelMessageSchema>
+export type ControlPlaneMessage = z.infer<typeof controlPlaneMessageSchema>
 
 export type RoutingEntry = {
   hostname: string

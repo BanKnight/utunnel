@@ -15,6 +15,22 @@ describe('config parsing', () => {
     expect(parsed.HEARTBEAT_GRACE_MS).toBe(15000)
   })
 
+  test('parses edge env with optional control shell auth settings', () => {
+    const parsed = parseEdgeEnv({
+      ROOT_DOMAIN: 'example.test',
+      OPERATOR_TOKEN: 'dev-token',
+      STALE_ROUTE_GRACE_MS: '30000',
+      HEARTBEAT_GRACE_MS: '15000',
+      UI_PASSWORD: 'console-password',
+      SESSION_SECRET: 'session-secret',
+      SESSION_TTL_MS: '86400000',
+    })
+
+    expect(parsed.UI_PASSWORD).toBe('console-password')
+    expect(parsed.SESSION_SECRET).toBe('session-secret')
+    expect(parsed.SESSION_TTL_MS).toBe(86400000)
+  })
+
   test('parses agent config with defaults', () => {
     const parsed = parseAgentConfig({
       hostId: 'host-1',
@@ -36,4 +52,37 @@ describe('config parsing', () => {
     expect(parsed.reconnectDelayMs).toBe(3000)
     expect(parsed.maxReconnectAttempts).toBe(5)
   })
+
+  test('parses bootstrap-first agent config while keeping services compatibility', () => {
+    const parsed = parseAgentConfig({
+      hostId: 'host-1',
+      hostname: 'machine-1',
+      edgeBaseUrl: 'http://127.0.0.1:8787',
+      bootstrapToken: 'bootstrap-token',
+      services: [
+        {
+          serviceId: 'svc-1',
+          serviceName: 'echo',
+          localUrl: 'http://127.0.0.1:3001',
+          protocol: 'http',
+          subdomain: 'echo.example.test',
+        },
+      ],
+    })
+
+    expect(parsed.bootstrapToken).toBe('bootstrap-token')
+    expect(parsed.services).toHaveLength(1)
+    expect(parsed.token).toBeUndefined()
+  })
+
+  test('requires at least one bootstrapToken or token', () => {
+    expect(() =>
+      parseAgentConfig({
+        hostId: 'host-1',
+        hostname: 'machine-1',
+        edgeBaseUrl: 'http://127.0.0.1:8787',
+      }),
+    ).toThrow()
+  })
 })
+
