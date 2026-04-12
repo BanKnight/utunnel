@@ -1,4 +1,4 @@
-import { Hono } from 'hono'
+import { Hono, type Context } from 'hono'
 import { parseEdgeEnv } from '@utunnel/config'
 import {
   type HostSessionRecord,
@@ -15,7 +15,9 @@ import {
   extractHostnameFromRequest,
   isHostAuthorized,
   isHostnameInRootDomain,
+  isLocalDevHostname,
   isOperatorAuthorized,
+  isSessionHealthy,
   normalizeServiceDefinitions,
   shouldCleanupStaleRoute,
 } from './lib'
@@ -33,6 +35,7 @@ export type EdgeBindings = {
   ROOT_DOMAIN: string
   OPERATOR_TOKEN: string
   STALE_ROUTE_GRACE_MS: string
+  HEARTBEAT_GRACE_MS: string
   ROUTING_DIRECTORY: NamespaceLike<FetchStub>
   HOST_SESSION: NamespaceLike<FetchStub>
 }
@@ -84,6 +87,33 @@ const parseAndValidatePayload = async (request: Request, env: EdgeBindings) => {
   } satisfies ServiceBindingPayload
 }
 
+const pruneRemovedHostRoutes = async (routing: FetchStub, hostId: string, keepHostnames: string[]) => {
+  const routesResponse = await routing.fetch('https://routing.internal/list')
+  if (!routesResponse.ok) {
+    return routesResponse
+  }
+
+  const keep = new Set(keepHostnames)
+  const routes = (await routesResponse.json()) as RoutingEntry[]
+  for (const route of routes) {
+    if (route.hostId !== hostId || keep.has(route.hostname)) {
+      continue
+    }
+
+    const unbindResponse = await routing.fetch(
+      toJsonRequest('https://routing.internal/unbind-stale', {
+        hostname: route.hostname,
+        deadline: Date.now(),
+      }),
+    )
+    if (!unbindResponse.ok) {
+      return unbindResponse
+    }
+  }
+
+  return null
+}
+
 const isBlockedRelayRequestHeader = (name: string) => {
   const normalized = name.toLowerCase()
   return (
@@ -98,6 +128,7 @@ const isBlockedRelayRequestHeader = (name: string) => {
     normalized === 'forwarded' ||
     normalized === 'x-real-ip' ||
     normalized.startsWith('x-forwarded-') ||
+    normalized === 'x-utunnel-route-host' ||
     normalized.startsWith('proxy-')
   )
 }
@@ -106,6 +137,30 @@ const buildRelayRequestHeaders = (request: Request) => {
   return Object.fromEntries(
     Array.from(request.headers.entries()).filter(([name]) => !isBlockedRelayRequestHeader(name)),
   ) satisfies Record<string, string>
+}
+
+const resolveIngressHostname = (
+  requestUrl: string,
+  hostHeader?: string | null,
+  overrideHostnameHeader?: string | null,
+) => {
+  const url = new URL(requestUrl)
+  const queryOverrideHostname = url.searchParams.get('__utunnel_host')
+  const pathOverrideHostname = (() => {
+    const match = url.pathname.match(/^\/tunnel\/__utunnel_host\/([^/]+)(?:\/|$)/)
+    return match ? decodeURIComponent(match[1]!) : null
+  })()
+  const requestHostname = extractHostnameFromRequest(requestUrl)
+  const isLocalIngress = (hostHeader ? isLocalDevHostname(hostHeader) : false) || isLocalDevHostname(requestHostname)
+
+  if (isLocalIngress) {
+    const localOverrideHostname = overrideHostnameHeader ?? queryOverrideHostname ?? pathOverrideHostname
+    if (localOverrideHostname) {
+      return extractHostnameFromRequest(requestUrl, localOverrideHostname)
+    }
+  }
+
+  return extractHostnameFromRequest(requestUrl, hostHeader)
 }
 
 const assertRelayPath = (path: string) => {
@@ -121,7 +176,9 @@ const assertRelayPath = (path: string) => {
 
 const buildRelayRequestPath = (requestUrl: string) => {
   const url = new URL(requestUrl)
-  const relayPath = url.pathname.replace(/^\/tunnel/, '') || '/'
+  url.searchParams.delete('__utunnel_host')
+  const pathWithOverrideRemoved = url.pathname.replace(/^\/tunnel\/__utunnel_host\/[^/]+(?=\/|$)/, '/tunnel')
+  const relayPath = pathWithOverrideRemoved.replace(/^\/tunnel/, '') || '/'
   const nextPath = `${relayPath}${url.search}`
   assertRelayPath(nextPath)
   return nextPath
@@ -137,6 +194,80 @@ type RelayWebSocketRequest = {
   expectedSessionId: string
   expectedVersion: number
   request: WebSocketOpenMessage
+}
+
+export const handleTunnelRequest = async (request: Request, env: EdgeBindings) => {
+  const hostname = resolveIngressHostname(request.url, request.headers.get('host'), request.headers.get('x-utunnel-route-host'))
+  if (!isHostnameInRootDomain(hostname, env.ROOT_DOMAIN)) {
+    return Response.json({ error: 'host_outside_root_domain' }, { status: 404 })
+  }
+
+  const relayPath = (() => {
+    try {
+      return buildRelayRequestPath(request.url)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'invalid_relay_path'
+      return message
+    }
+  })()
+
+  if (relayPath === 'invalid_relay_path') {
+    return Response.json({ error: 'invalid_relay_path' }, { status: 400 })
+  }
+
+  const routing = getRoutingStub(env)
+  const resolveRes = await routing.fetch(`https://routing.internal/resolve?hostname=${encodeURIComponent(hostname)}`)
+
+  if (!resolveRes.ok) {
+    return Response.json({ error: 'route_not_found' }, { status: 404 })
+  }
+
+  const route = (await resolveRes.json()) as RoutingEntry
+  const hostStub = getHostStub(env, route.hostId)
+
+  if (request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
+    const relayRequest: RelayWebSocketRequest = {
+      expectedSessionId: route.sessionId,
+      expectedVersion: route.version,
+      request: {
+        type: 'ws_open',
+        payload: {
+          streamId: crypto.randomUUID(),
+          serviceId: route.serviceId,
+          path: relayPath,
+          headers: buildRelayRequestHeaders(request),
+        },
+      },
+    }
+
+    return hostStub.fetch(
+      new Request('https://host.internal/relay-ws', {
+        method: 'GET',
+        headers: new Headers({
+          Upgrade: 'websocket',
+          'x-utunnel-relay-payload': JSON.stringify(relayRequest),
+        }),
+      }),
+    )
+  }
+
+  const relayRequest: RelayHttpRequest = {
+    expectedSessionId: route.sessionId,
+    expectedVersion: route.version,
+    request: {
+      type: 'http_request',
+      payload: {
+        streamId: crypto.randomUUID(),
+        serviceId: route.serviceId,
+        method: request.method,
+        path: relayPath,
+        headers: buildRelayRequestHeaders(request),
+        body: ['GET', 'HEAD'].includes(request.method.toUpperCase()) ? '' : await request.text(),
+      },
+    },
+  }
+
+  return hostStub.fetch(toJsonRequest('https://host.internal/relay-http', relayRequest))
 }
 
 export const createEdgeApp = () => {
@@ -199,6 +330,15 @@ export const createEdgeApp = () => {
       return registerResponse
     }
 
+    const pruneResponse = await pruneRemovedHostRoutes(
+      routing,
+      hostId,
+      payload.services.map((service) => service.subdomain),
+    )
+    if (pruneResponse) {
+      return pruneResponse
+    }
+
     return c.json({ ok: true, count: payload.services.length, mode: 'register' })
   })
 
@@ -252,6 +392,15 @@ export const createEdgeApp = () => {
     )
     if (!registerResponse.ok) {
       return registerResponse
+    }
+
+    const pruneResponse = await pruneRemovedHostRoutes(
+      routing,
+      hostId,
+      payload.services.map((service) => service.subdomain),
+    )
+    if (pruneResponse) {
+      return pruneResponse
     }
 
     return c.json({ ok: true, count: payload.services.length, mode: 'rebind' })
@@ -332,77 +481,38 @@ export const createEdgeApp = () => {
     return hostStub.fetch('https://host.internal/session')
   })
 
-  app.all('/tunnel/*', async (c) => {
-    const hostname = extractHostnameFromRequest(c.req.url, c.req.header('host'))
-    if (!isHostnameInRootDomain(hostname, c.env.ROOT_DOMAIN)) {
-      return c.json({ error: 'host_outside_root_domain' }, 404)
+  app.get('/api/hosts/:hostId/health', async (c) => {
+    if (!requireOperatorAuthorization(c.req.raw, c.env)) {
+      return unauthorized('invalid_operator_token')
     }
 
-    const relayPath = (() => {
-      try {
-        return buildRelayRequestPath(c.req.url)
-      } catch (error) {
-        const message = error instanceof Error ? error.message : 'invalid_relay_path'
-        return message
-      }
-    })()
+    const edgeEnv = parseEdgeEnv(c.env)
+    const hostStub = getHostStub(c.env, c.req.param('hostId'))
+    const sessionResponse = await hostStub.fetch('https://host.internal/session')
+    const session = (await sessionResponse.json()) as HostSessionRecord | null
 
-    if (relayPath === 'invalid_relay_path') {
-      return c.json({ error: 'invalid_relay_path' }, 400)
+    if (!session) {
+      return c.json({ ok: false, reason: 'session_not_found' }, 404)
     }
 
-    const routing = getRoutingStub(c.env)
-    const resolveRes = await routing.fetch(`https://routing.internal/resolve?hostname=${encodeURIComponent(hostname)}`)
-
-    if (!resolveRes.ok) {
-      return c.json({ error: 'route_not_found' }, 404)
-    }
-
-    const route = (await resolveRes.json()) as RoutingEntry
-    const hostStub = getHostStub(c.env, route.hostId)
-
-    if (c.req.header('Upgrade')?.toLowerCase() === 'websocket') {
-      const relayRequest: RelayWebSocketRequest = {
-        expectedSessionId: route.sessionId,
-        expectedVersion: route.version,
-        request: {
-          type: 'ws_open',
-          payload: {
-            streamId: crypto.randomUUID(),
-            serviceId: route.serviceId,
-            path: relayPath,
-            headers: buildRelayRequestHeaders(c.req.raw),
-          },
-        },
-      }
-
-      return hostStub.fetch(
-        new Request('https://host.internal/relay-ws', {
-          method: 'POST',
-          headers: c.req.raw.headers,
-          body: JSON.stringify(relayRequest),
-        }),
-      )
-    }
-
-    const relayRequest: RelayHttpRequest = {
-      expectedSessionId: route.sessionId,
-      expectedVersion: route.version,
-      request: {
-        type: 'http_request',
-        payload: {
-          streamId: crypto.randomUUID(),
-          serviceId: route.serviceId,
-          method: c.req.method,
-          path: relayPath,
-          headers: buildRelayRequestHeaders(c.req.raw),
-          body: ['GET', 'HEAD'].includes(c.req.method.toUpperCase()) ? '' : await c.req.raw.text(),
-        },
-      },
-    }
-
-    return hostStub.fetch(toJsonRequest('https://host.internal/relay-http', relayRequest))
+    return c.json({
+      hostId: session.hostId,
+      sessionId: session.sessionId,
+      version: session.version,
+      healthy: isSessionHealthy(session, edgeEnv.HEARTBEAT_GRACE_MS),
+      lastHeartbeatAt: session.lastHeartbeatAt,
+      disconnectedAt: session.disconnectedAt,
+      serviceCount: session.services.length,
+    })
   })
+
+  const tunnelHandler = (c: Context<HonoEnv>) => handleTunnelRequest(c.req.raw, c.env)
+
+  app.get('/tunnel/socket', tunnelHandler)
+  app.get('/tunnel/__utunnel_host/:hostname/socket', tunnelHandler)
+  app.get('/tunnel/*', tunnelHandler)
+  app.all('/tunnel/*', tunnelHandler)
+
 
   return app
 }

@@ -7,10 +7,12 @@ describe('config parsing', () => {
       ROOT_DOMAIN: 'example.test',
       OPERATOR_TOKEN: 'dev-token',
       STALE_ROUTE_GRACE_MS: '30000',
+      HEARTBEAT_GRACE_MS: '15000',
     })
 
     expect(parsed.ROOT_DOMAIN).toBe('example.test')
     expect(parsed.STALE_ROUTE_GRACE_MS).toBe(30000)
+    expect(parsed.HEARTBEAT_GRACE_MS).toBe(15000)
   })
 
   test('parses agent config with defaults', () => {

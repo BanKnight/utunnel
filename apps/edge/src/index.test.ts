@@ -65,11 +65,13 @@ type SessionRecord = {
   version: number
   services: Array<{ subdomain: string; serviceId: string }>
   connectedAt: number
+  lastHeartbeatAt: number
   disconnectedAt: number | null
 }
 
 class FakeHostStub {
   session: SessionRecord | null = null
+  httpDelayMsByServiceId = new Map<string, number>()
   relayHttpHistory: Array<{
     expectedSessionId: string
     expectedVersion: number
@@ -118,6 +120,9 @@ class FakeHostStub {
 
     if (request.method === 'POST' && url.pathname === '/register') {
       this.session = (await request.json()) as SessionRecord
+      if (this.session.lastHeartbeatAt === undefined) {
+        this.session = { ...this.session, lastHeartbeatAt: this.session.connectedAt }
+      }
       return Response.json(this.session)
     }
 
@@ -148,6 +153,11 @@ class FakeHostStub {
         return Response.json({ ok: false, reason: 'stale_session_binding' }, { status: 409 })
       }
 
+      const delayMs = this.httpDelayMsByServiceId.get(relay.request.payload.serviceId) ?? 0
+      if (delayMs > 0) {
+        await Bun.sleep(delayMs)
+      }
+
       return Response.json(
         {
           ok: true,
@@ -168,8 +178,13 @@ class FakeHostStub {
       )
     }
 
-    if (request.method === 'POST' && url.pathname === '/relay-ws') {
-      const relay = (await request.json()) as {
+    if (request.method === 'GET' && url.pathname === '/relay-ws') {
+      const relayHeader = request.headers.get('x-utunnel-relay-payload')
+      if (!relayHeader) {
+        return Response.json({ ok: false, reason: 'missing_relay_payload' }, { status: 400 })
+      }
+
+      const relay = JSON.parse(relayHeader) as {
         expectedSessionId: string
         expectedVersion: number
         request: {
@@ -240,6 +255,7 @@ const createEnv = () => {
     ROOT_DOMAIN: 'example.test',
     OPERATOR_TOKEN: 'dev-operator-token',
     STALE_ROUTE_GRACE_MS: '100',
+    HEARTBEAT_GRACE_MS: '1000',
     ROUTING_DIRECTORY: routing,
     HOST_SESSION: hosts,
   }
@@ -320,6 +336,56 @@ describe('edge app integration', () => {
     expect(response.status).toBe(200)
   })
 
+  test('reports host health from session heartbeat state', async () => {
+    const env = createEnv()
+    const authHeader = {
+      authorization: `Bearer ${buildHostToken('host-1', env.OPERATOR_TOKEN)}`,
+      'content-type': 'application/json',
+    }
+
+    const register = await app.request(
+      'http://edge.test/api/hosts/host-1/services',
+      {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({
+          sessionId: 'session-health-1',
+          version: 1,
+          services: [
+            {
+              serviceId: 'svc-health',
+              serviceName: 'health',
+              localUrl: 'http://127.0.0.1:3001',
+              protocol: 'http',
+              subdomain: 'health.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+    expect(register.status).toBe(200)
+
+    const operatorHeader = { authorization: 'Bearer dev-operator-token' }
+    const health = await app.request('http://edge.test/api/hosts/host-1/health', { headers: operatorHeader }, env)
+    const json = (await health.json()) as {
+      hostId: string
+      sessionId: string
+      version: number
+      healthy: boolean
+      lastHeartbeatAt: number
+      disconnectedAt: number | null
+      serviceCount: number
+    }
+
+    expect(health.status).toBe(200)
+    expect(json.hostId).toBe('host-1')
+    expect(json.sessionId).toBe('session-health-1')
+    expect(json.healthy).toBe(true)
+    expect(json.lastHeartbeatAt).toBeTypeOf('number')
+    expect(json.serviceCount).toBe(1)
+  })
+
   test('registers routes and cleans up stale bindings', async () => {
     const env = createEnv()
     const authHeader = {
@@ -377,6 +443,7 @@ describe('edge app integration', () => {
     expect(afterJson).toHaveLength(0)
   })
 
+
   test('routes multiple services on the same host without cross-wiring', async () => {
     const env = createEnv()
     const authHeader = {
@@ -430,6 +497,237 @@ describe('edge app integration', () => {
     expect(host.relayHttpHistory).toHaveLength(2)
     expect(host.relayHttpHistory.map((entry) => entry.request.payload.serviceId).sort()).toEqual(['svc-one', 'svc-two'])
     expect(host.relayHttpHistory.map((entry) => entry.request.payload.path).sort()).toEqual(['/one?x=1', '/two?y=1'])
+  })
+
+  test('removes stale host routes when service registration drops a hostname', async () => {
+    const env = createEnv()
+    const authHeader = {
+      authorization: `Bearer ${buildHostToken('host-1', env.OPERATOR_TOKEN)}`,
+      'content-type': 'application/json',
+    }
+
+    const firstRegister = await app.request(
+      'http://edge.test/api/hosts/host-1/services',
+      {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({
+          sessionId: 'session-prune-1',
+          version: 1,
+          services: [
+            {
+              serviceId: 'svc-keep',
+              serviceName: 'keep',
+              localUrl: 'http://127.0.0.1:3001',
+              protocol: 'http',
+              subdomain: 'keep.example.test',
+            },
+            {
+              serviceId: 'svc-drop',
+              serviceName: 'drop',
+              localUrl: 'http://127.0.0.1:3002',
+              protocol: 'http',
+              subdomain: 'drop.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+    expect(firstRegister.status).toBe(200)
+
+    const secondRegister = await app.request(
+      'http://edge.test/api/hosts/host-1/services',
+      {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({
+          sessionId: 'session-prune-2',
+          version: 2,
+          services: [
+            {
+              serviceId: 'svc-keep',
+              serviceName: 'keep',
+              localUrl: 'http://127.0.0.1:3001',
+              protocol: 'http',
+              subdomain: 'keep.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+    expect(secondRegister.status).toBe(200)
+
+    const operatorHeader = { authorization: 'Bearer dev-operator-token' }
+    const routes = await app.request('http://edge.test/api/routes', { headers: operatorHeader }, env)
+    const routeJson = (await routes.json()) as RoutingEntry[]
+    expect(routeJson).toHaveLength(1)
+    expect(routeJson[0]?.hostname).toBe('keep.example.test')
+    expect(routeJson[0]?.sessionId).toBe('session-prune-2')
+
+    const keepResponse = await app.request(
+      'http://edge.test/tunnel/ok',
+      { headers: { host: 'keep.example.test' } },
+      env,
+    )
+    expect(keepResponse.status).toBe(200)
+
+    const droppedResponse = await app.request(
+      'http://edge.test/tunnel/missing',
+      { headers: { host: 'drop.example.test' } },
+      env,
+    )
+    const droppedJson = (await droppedResponse.json()) as { error: string }
+    expect(droppedResponse.status).toBe(404)
+    expect(droppedJson).toEqual({ error: 'route_not_found' })
+  })
+
+  test('lets a fast service finish before a delayed sibling service on the same host', async () => {
+    const env = createEnv()
+    const authHeader = {
+      authorization: `Bearer ${buildHostToken('host-1', env.OPERATOR_TOKEN)}`,
+      'content-type': 'application/json',
+    }
+
+    const register = await app.request(
+      'http://edge.test/api/hosts/host-1/services',
+      {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({
+          sessionId: 'session-concurrency-1',
+          version: 1,
+          services: [
+            {
+              serviceId: 'svc-fast',
+              serviceName: 'fast',
+              localUrl: 'http://127.0.0.1:3101',
+              protocol: 'http',
+              subdomain: 'fast.example.test',
+            },
+            {
+              serviceId: 'svc-slow',
+              serviceName: 'slow',
+              localUrl: 'http://127.0.0.1:3102',
+              protocol: 'http',
+              subdomain: 'slow.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+    expect(register.status).toBe(200)
+
+    const host = env.HOST_SESSION.get('host-1') as FakeHostStub & {
+      httpDelayMsByServiceId?: Map<string, number>
+    }
+    host.httpDelayMsByServiceId = new Map([['svc-slow', 50]])
+
+    let fastFinishedAt = 0
+    let slowFinishedAt = 0
+
+    const fastPromise = Promise.resolve(
+      app.request('http://edge.test/tunnel/fast', { headers: { host: 'fast.example.test' } }, env),
+    ).then((response) => {
+      fastFinishedAt = Date.now()
+      return response
+    })
+
+    const slowPromise = Promise.resolve(
+      app.request('http://edge.test/tunnel/slow', { headers: { host: 'slow.example.test' } }, env),
+    ).then((response) => {
+      slowFinishedAt = Date.now()
+      return response
+    })
+
+    const [fastResponse, slowResponse] = await Promise.all([fastPromise, slowPromise])
+    const fastJson = (await fastResponse.json()) as Record<string, string | null>
+    const slowJson = (await slowResponse.json()) as Record<string, string | null>
+
+    expect(fastResponse.status).toBe(200)
+    expect(slowResponse.status).toBe(200)
+    expect(fastJson.serviceId).toBe('svc-fast')
+    expect(slowJson.serviceId).toBe('svc-slow')
+    expect(fastFinishedAt).toBeLessThan(slowFinishedAt)
+  })
+
+  test('keeps websocket upgrades responsive while a delayed http service is in flight', async () => {
+    const env = createEnv()
+    const authHeader = {
+      authorization: `Bearer ${buildHostToken('host-1', env.OPERATOR_TOKEN)}`,
+      'content-type': 'application/json',
+    }
+
+    const register = await app.request(
+      'http://edge.test/api/hosts/host-1/services',
+      {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({
+          sessionId: 'session-concurrency-2',
+          version: 1,
+          services: [
+            {
+              serviceId: 'svc-slow-http',
+              serviceName: 'slow-http',
+              localUrl: 'http://127.0.0.1:3201',
+              protocol: 'http',
+              subdomain: 'slow-http.example.test',
+            },
+            {
+              serviceId: 'svc-fast-ws',
+              serviceName: 'fast-ws',
+              localUrl: 'http://127.0.0.1:3202',
+              protocol: 'websocket',
+              subdomain: 'fast-ws.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+    expect(register.status).toBe(200)
+
+    const host = env.HOST_SESSION.get('host-1') as FakeHostStub & {
+      httpDelayMsByServiceId?: Map<string, number>
+    }
+    host.httpDelayMsByServiceId = new Map([['svc-slow-http', 50]])
+
+    let httpFinishedAt = 0
+    let wsFinishedAt = 0
+
+    const slowHttpPromise = Promise.resolve(
+      app.request('http://edge.test/tunnel/slow-http', { headers: { host: 'slow-http.example.test' } }, env),
+    ).then((response) => {
+      httpFinishedAt = Date.now()
+      return response
+    })
+
+    const wsPromise = Promise.resolve(
+      app.request(
+        'http://edge.test/tunnel/socket?channel=slow-proof',
+        {
+          method: 'GET',
+          headers: {
+            host: 'fast-ws.example.test',
+            upgrade: 'websocket',
+          },
+        },
+        env,
+      ),
+    ).then((response) => {
+      wsFinishedAt = Date.now()
+      return response
+    })
+
+    const [slowHttpResponse, wsResponse] = await Promise.all([slowHttpPromise, wsPromise])
+
+    expect(slowHttpResponse.status).toBe(200)
+    expect(wsResponse.status).toBe(101)
+    expect(host.lastRelayWs?.request.payload.serviceId).toBe('svc-fast-ws')
+    expect(wsFinishedAt).toBeLessThan(httpFinishedAt)
   })
 
   test('routes multiple host subdomains to the correct owning host', async () => {
@@ -601,6 +899,149 @@ describe('edge app integration', () => {
     expect(hostStub.lastRelayWs?.expectedSessionId).toBe('session-ws-1')
     expect(hostStub.lastRelayWs?.expectedVersion).toBe(1)
     expect(hostStub.lastRelayWs?.request.payload.serviceId).toBe('svc-ws')
+    expect(hostStub.lastRelayWs?.request.payload.path).toBe('/socket?channel=1')
+  })
+
+  test('upgrades websocket tunnel request from local dev host when route host is provided in query', async () => {
+    const env = createEnv()
+    const authHeader = {
+      authorization: `Bearer ${buildHostToken('host-1', env.OPERATOR_TOKEN)}`,
+      'content-type': 'application/json',
+    }
+
+    await app.request(
+      'http://edge.test/api/hosts/host-1/services',
+      {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({
+          sessionId: 'session-ws-local-1',
+          version: 1,
+          services: [
+            {
+              serviceId: 'svc-ws-local',
+              serviceName: 'echo-ws-local',
+              localUrl: 'http://127.0.0.1:3002',
+              protocol: 'websocket',
+              subdomain: 'ws-local.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+
+    const response = await app.request(
+      'http://127.0.0.1/tunnel/socket?channel=1&__utunnel_host=ws-local.example.test',
+      {
+        method: 'GET',
+        headers: {
+          host: '127.0.0.1',
+          upgrade: 'websocket',
+        },
+      },
+      env,
+    )
+
+    const hostStub = env.HOST_SESSION.get('host-1')
+
+    expect(response.status).toBe(101)
+    expect(hostStub.lastRelayWs?.request.payload.serviceId).toBe('svc-ws-local')
+    expect(hostStub.lastRelayWs?.request.payload.path).toBe('/socket?channel=1')
+  })
+
+  test('upgrades websocket tunnel request from local dev url without host header when query override is provided', async () => {
+    const env = createEnv()
+    const authHeader = {
+      authorization: `Bearer ${buildHostToken('host-1', env.OPERATOR_TOKEN)}`,
+      'content-type': 'application/json',
+    }
+
+    await app.request(
+      'http://edge.test/api/hosts/host-1/services',
+      {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({
+          sessionId: 'session-ws-local-url-1',
+          version: 1,
+          services: [
+            {
+              serviceId: 'svc-ws-local-url',
+              serviceName: 'echo-ws-local-url',
+              localUrl: 'http://127.0.0.1:3002',
+              protocol: 'websocket',
+              subdomain: 'ws-local-url.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+
+    const request = new Request(
+      'http://127.0.0.1/tunnel/socket?channel=1&__utunnel_host=ws-local-url.example.test',
+      {
+        method: 'GET',
+        headers: {
+          upgrade: 'websocket',
+        },
+      },
+    )
+
+    const response = await app.fetch(request, env)
+    const hostStub = env.HOST_SESSION.get('host-1')
+
+    expect(response.status).toBe(101)
+    expect(hostStub.lastRelayWs?.request.payload.serviceId).toBe('svc-ws-local-url')
+    expect(hostStub.lastRelayWs?.request.payload.path).toBe('/socket?channel=1')
+  })
+
+  test('upgrades websocket tunnel request from local dev path override', async () => {
+    const env = createEnv()
+    const authHeader = {
+      authorization: `Bearer ${buildHostToken('host-1', env.OPERATOR_TOKEN)}`,
+      'content-type': 'application/json',
+    }
+
+    await app.request(
+      'http://edge.test/api/hosts/host-1/services',
+      {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({
+          sessionId: 'session-ws-local-path-1',
+          version: 1,
+          services: [
+            {
+              serviceId: 'svc-ws-local-path',
+              serviceName: 'echo-ws-local-path',
+              localUrl: 'http://127.0.0.1:3002',
+              protocol: 'websocket',
+              subdomain: 'ws-local-path.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+
+    const response = await app.request(
+      'http://127.0.0.1/tunnel/__utunnel_host/ws-local-path.example.test/socket?channel=1',
+      {
+        method: 'GET',
+        headers: {
+          host: '127.0.0.1',
+          upgrade: 'websocket',
+        },
+      },
+      env,
+    )
+
+    const hostStub = env.HOST_SESSION.get('host-1')
+
+    expect(response.status).toBe(101)
+    expect(hostStub.lastRelayWs?.request.payload.serviceId).toBe('svc-ws-local-path')
     expect(hostStub.lastRelayWs?.request.payload.path).toBe('/socket?channel=1')
   })
 
@@ -879,6 +1320,99 @@ describe('edge app integration', () => {
     expect(restored.status).toBe(200)
     expect(restoredJson.path).toBe('/status?after=rebind')
     expect(restoredJson.serviceId).toBe('svc-1')
+  })
+
+  test('rebind removes stale host routes that are no longer declared', async () => {
+    const env = createEnv()
+    const authHeader = {
+      authorization: `Bearer ${buildHostToken('host-1', env.OPERATOR_TOKEN)}`,
+      'content-type': 'application/json',
+    }
+
+    const initialRegister = await app.request(
+      'http://edge.test/api/hosts/host-1/services',
+      {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({
+          sessionId: 'session-rebind-1',
+          version: 1,
+          services: [
+            {
+              serviceId: 'svc-keep',
+              serviceName: 'keep',
+              localUrl: 'http://127.0.0.1:3001',
+              protocol: 'http',
+              subdomain: 'keep.example.test',
+            },
+            {
+              serviceId: 'svc-drop',
+              serviceName: 'drop',
+              localUrl: 'http://127.0.0.1:3002',
+              protocol: 'http',
+              subdomain: 'drop.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+    expect(initialRegister.status).toBe(200)
+
+    const disconnect = await app.request(
+      'http://edge.test/api/hosts/host-1/disconnect',
+      { method: 'POST', headers: authHeader },
+      env,
+    )
+    expect(disconnect.status).toBe(200)
+
+    const rebind = await app.request(
+      'http://edge.test/api/hosts/host-1/rebind',
+      {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({
+          previousSessionId: 'session-rebind-1',
+          sessionId: 'session-rebind-2',
+          version: 2,
+          services: [
+            {
+              serviceId: 'svc-keep',
+              serviceName: 'keep',
+              localUrl: 'http://127.0.0.1:3001',
+              protocol: 'http',
+              subdomain: 'keep.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+    expect(rebind.status).toBe(200)
+
+    const operatorHeader = { authorization: 'Bearer dev-operator-token' }
+    const routes = await app.request('http://edge.test/api/routes', { headers: operatorHeader }, env)
+    const routeJson = (await routes.json()) as RoutingEntry[]
+    expect(routeJson).toHaveLength(1)
+    expect(routeJson[0]?.hostname).toBe('keep.example.test')
+    expect(routeJson[0]?.sessionId).toBe('session-rebind-2')
+    expect(routeJson[0]?.version).toBe(2)
+
+    const keptResponse = await app.request(
+      'http://edge.test/tunnel/status?after=rebind',
+      { headers: { host: 'keep.example.test' } },
+      env,
+    )
+    expect(keptResponse.status).toBe(200)
+
+    const droppedResponse = await app.request(
+      'http://edge.test/tunnel/status?after=rebind',
+      { headers: { host: 'drop.example.test' } },
+      env,
+    )
+    const droppedJson = (await droppedResponse.json()) as { error: string }
+    expect(droppedResponse.status).toBe(404)
+    expect(droppedJson).toEqual({ error: 'route_not_found' })
   })
 
   test('rejects rebind when previous session id mismatches', async () => {

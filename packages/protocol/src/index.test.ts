@@ -33,6 +33,7 @@ describe('protocol schemas', () => {
       sessionId: 'session-1',
       version: 1,
       connectedAt: Date.now(),
+      lastHeartbeatAt: Date.now(),
       disconnectedAt: null,
       services: [
         {
@@ -46,5 +47,6 @@ describe('protocol schemas', () => {
     })
 
     expect(result.version).toBe(1)
+    expect(result.lastHeartbeatAt).toBeTypeOf('number')
   })
 })

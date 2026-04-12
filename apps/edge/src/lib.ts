@@ -78,7 +78,16 @@ export const buildHostSessionRecord = (
   version: payload.version,
   services: normalizeServiceDefinitions(payload.services),
   connectedAt: now,
+  lastHeartbeatAt: now,
   disconnectedAt: null,
+})
+
+export const markSessionHeartbeat = (
+  session: HostSessionRecord,
+  now = Date.now(),
+): HostSessionRecord => ({
+  ...session,
+  lastHeartbeatAt: now,
 })
 
 export const markSessionDisconnected = (
@@ -101,7 +110,25 @@ export const shouldCleanupStaleRoute = (
   return now - session.disconnectedAt >= staleRouteGraceMs
 }
 
+export const isSessionHealthy = (
+  session: HostSessionRecord | null,
+  heartbeatGraceMs: number,
+  now = Date.now(),
+): boolean => {
+  if (!session || session.disconnectedAt !== null) {
+    return false
+  }
+
+  return now - session.lastHeartbeatAt <= heartbeatGraceMs
+}
+
+export const isLocalDevHostname = (hostname: string): boolean => {
+  const normalized = normalizeHostname(hostname)
+  return normalized === 'localhost' || normalized === '127.0.0.1'
+}
+
 export const extractHostnameFromRequest = (requestUrl: string, hostHeader?: string | null): string => {
+
   if (hostHeader && hostHeader.length > 0) {
     return normalizeHostname(hostHeader)
   }

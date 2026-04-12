@@ -7,9 +7,12 @@ import {
   extractHostnameFromRequest,
   hasHostnameConflict,
   isHostAuthorized,
+  isLocalDevHostname,
   isHostnameInRootDomain,
   isOperatorAuthorized,
+  isSessionHealthy,
   markSessionDisconnected,
+  markSessionHeartbeat,
   normalizeHostname,
   normalizeServiceDefinitions,
   shouldCleanupStaleRoute,
@@ -42,6 +45,21 @@ describe('edge lifecycle helpers', () => {
 
     expect(shouldCleanupStaleRoute(disconnected, 100, 200)).toBe(false)
     expect(shouldCleanupStaleRoute(disconnected, 100, 260)).toBe(true)
+  })
+
+  test('updates heartbeat timestamp and reports health within grace window', () => {
+    const session = buildHostSessionRecord('host-1', payload, 100)
+    const withHeartbeat = markSessionHeartbeat(session, 180)
+
+    expect(withHeartbeat.lastHeartbeatAt).toBe(180)
+    expect(isSessionHealthy(withHeartbeat, 50, 220)).toBe(true)
+    expect(isSessionHealthy(withHeartbeat, 30, 220)).toBe(false)
+  })
+
+  test('detects local dev hostnames', () => {
+    expect(isLocalDevHostname('127.0.0.1:8787')).toBe(true)
+    expect(isLocalDevHostname('localhost:8787')).toBe(true)
+    expect(isLocalDevHostname('echo.example.test')).toBe(false)
   })
 
   test('normalizes hostname and strips port', () => {

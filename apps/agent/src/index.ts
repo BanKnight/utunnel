@@ -38,6 +38,8 @@ type CreateUpstreamSocket = (url: string, headers: Record<string, string>) => Up
 
 export type RelayState = {
   websocketStreams: Map<string, UpstreamSocketLike>
+  pendingWebSocketFrames: Map<string, string[]>
+  openWebSocketStreams: Set<string>
 }
 
 const loadConfig = async () => {
@@ -111,10 +113,28 @@ const connectHostSession = async (edgeBaseUrl: string, hostId: string, token: st
   return socket
 }
 
-const startHeartbeat = (socket: WebSocket) => {
+export const sendHeartbeat = (
+  socket: Pick<WebSocket, 'send'>,
+  hostId: string,
+  sessionId: string,
+  now = new Date(),
+) => {
+  socket.send(
+    JSON.stringify({
+      type: 'heartbeat',
+      payload: {
+        hostId,
+        sessionId,
+        timestamp: now.toISOString(),
+      },
+    }),
+  )
+}
+
+const startHeartbeat = (socket: WebSocket, hostId: string, sessionId: string) => {
   return setInterval(() => {
     if (socket.readyState === WebSocket.OPEN) {
-      socket.send('ping')
+      sendHeartbeat(socket, hostId, sessionId)
     }
   }, 10_000)
 }
@@ -158,6 +178,8 @@ const createUpstreamSocket: CreateUpstreamSocket = (url, headers) => {
 
 export const createRelayState = (): RelayState => ({
   websocketStreams: new Map(),
+  pendingWebSocketFrames: new Map(),
+  openWebSocketStreams: new Set(),
 })
 
 export const forwardHttpRequest = async (
@@ -259,6 +281,16 @@ const handleWebSocketOpen = async (
 
   const upstreamSocket = openSocket(upstreamUrl.toString(), message.payload.headers)
   relayState.websocketStreams.set(message.payload.streamId, upstreamSocket)
+  relayState.pendingWebSocketFrames.set(message.payload.streamId, [])
+
+  upstreamSocket.addEventListener('open', () => {
+    relayState.openWebSocketStreams.add(message.payload.streamId)
+    const pendingFrames = relayState.pendingWebSocketFrames.get(message.payload.streamId) ?? []
+    for (const pendingFrame of pendingFrames) {
+      upstreamSocket.send(pendingFrame)
+    }
+    relayState.pendingWebSocketFrames.delete(message.payload.streamId)
+  })
 
   upstreamSocket.addEventListener('message', (event) => {
     const frameMessage: WebSocketFrameMessage = {
@@ -273,11 +305,15 @@ const handleWebSocketOpen = async (
 
   upstreamSocket.addEventListener('close', (event) => {
     relayState.websocketStreams.delete(message.payload.streamId)
+    relayState.pendingWebSocketFrames.delete(message.payload.streamId)
+    relayState.openWebSocketStreams.delete(message.payload.streamId)
     sendSocketClose(edgeSocket, message.payload.streamId, event?.code, event?.reason)
   })
 
   upstreamSocket.addEventListener('error', () => {
     relayState.websocketStreams.delete(message.payload.streamId)
+    relayState.pendingWebSocketFrames.delete(message.payload.streamId)
+    relayState.openWebSocketStreams.delete(message.payload.streamId)
     sendSocketClose(edgeSocket, message.payload.streamId, 1011, 'upstream_websocket_error')
   })
 }
@@ -301,13 +337,27 @@ export const handleTunnelMessage = async (
   }
 
   if (message.type === 'ws_frame') {
-    relayState.websocketStreams.get(message.payload.streamId)?.send(message.payload.data)
+    const upstreamSocket = relayState.websocketStreams.get(message.payload.streamId)
+    if (!upstreamSocket) {
+      return
+    }
+
+    if (!relayState.openWebSocketStreams.has(message.payload.streamId)) {
+      const pendingFrames = relayState.pendingWebSocketFrames.get(message.payload.streamId) ?? []
+      pendingFrames.push(message.payload.data)
+      relayState.pendingWebSocketFrames.set(message.payload.streamId, pendingFrames)
+      return
+    }
+
+    upstreamSocket.send(message.payload.data)
     return
   }
 
   if (message.type === 'ws_close') {
     relayState.websocketStreams.get(message.payload.streamId)?.close(message.payload.code, message.payload.reason)
     relayState.websocketStreams.delete(message.payload.streamId)
+    relayState.pendingWebSocketFrames.delete(message.payload.streamId)
+    relayState.openWebSocketStreams.delete(message.payload.streamId)
   }
 }
 
@@ -334,7 +384,7 @@ const runAgentCycle = async (config: AgentConfig, state: RuntimeState) => {
   await verifyHostToken(config)
   const socket = await connectHostSession(config.edgeBaseUrl, config.hostId, config.token)
   attachRelayHandlers(socket, config.services)
-  const heartbeat = startHeartbeat(socket)
+  const heartbeat = startHeartbeat(socket, config.hostId, state.sessionId)
   const registration = await registerServices(config.edgeBaseUrl, config.hostId, state, config.services, config.token)
 
   console.log(

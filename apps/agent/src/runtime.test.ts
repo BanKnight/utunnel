@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import type { HttpRequestMessage, WebSocketCloseMessage, WebSocketFrameMessage, WebSocketOpenMessage } from '@utunnel/protocol'
 import { buildServiceBindingPayload, createDefaultAgentConfig, createNextRuntimeState, resolveRegistrationPath } from './runtime'
-import { createRelayState, forwardHttpRequest, handleTunnelMessage } from './index'
+import { createRelayState, forwardHttpRequest, handleTunnelMessage, sendHeartbeat } from './index'
 
 class FakeUpstreamSocket {
   listeners = new Map<string, Array<(event?: { code?: number; data?: string; reason?: string }) => void>>()
@@ -55,6 +55,22 @@ describe('agent runtime helpers', () => {
 
     expect(payload.sessionId).toBe(state.sessionId)
     expect(payload.services).toHaveLength(1)
+  })
+
+  test('sends structured heartbeat messages', () => {
+    const sent: string[] = []
+
+    sendHeartbeat({ send: (data: string) => sent.push(data) }, 'host-1', 'session-1', new Date('2026-04-12T00:00:00.000Z'))
+
+    expect(sent).toHaveLength(1)
+    expect(JSON.parse(sent[0]!)).toEqual({
+      type: 'heartbeat',
+      payload: {
+        hostId: 'host-1',
+        sessionId: 'session-1',
+        timestamp: '2026-04-12T00:00:00.000Z',
+      },
+    })
   })
 
   test('forwards http request to local upstream', async () => {
@@ -163,6 +179,7 @@ describe('agent runtime helpers', () => {
     )
 
     expect(relayState.websocketStreams.get('ws-1')).toBe(upstreamSocket)
+    upstreamSocket.emit('open')
 
     const frameFromEdge: WebSocketFrameMessage = {
       type: 'ws_frame',
@@ -252,6 +269,9 @@ describe('agent runtime helpers', () => {
       () => (socketIndex++ === 0 ? upstreamA : upstreamB),
     )
 
+    upstreamA.emit('open')
+    upstreamB.emit('open')
+
     await handleTunnelMessage(
       { type: 'ws_frame', payload: { streamId: 'stream-a', data: 'alpha' } },
       services,
@@ -303,6 +323,55 @@ describe('agent runtime helpers', () => {
     })
   })
 
+
+  test('queues websocket frames until upstream socket opens', async () => {
+    const relayState = createRelayState()
+    const upstreamSocket = new FakeUpstreamSocket()
+
+    await handleTunnelMessage(
+      {
+        type: 'ws_open',
+        payload: {
+          streamId: 'ws-queued',
+          serviceId: 'svc-ws',
+          path: '/socket',
+          headers: {},
+        },
+      },
+      [
+        {
+          serviceId: 'svc-ws',
+          serviceName: 'echo-ws',
+          localUrl: 'http://127.0.0.1:3001',
+          protocol: 'websocket',
+          subdomain: 'ws.example.test',
+        },
+      ],
+      relayState,
+      { send: () => {} },
+      () => upstreamSocket,
+    )
+
+    await handleTunnelMessage(
+      {
+        type: 'ws_frame',
+        payload: {
+          streamId: 'ws-queued',
+          data: 'hello-before-open',
+        },
+      },
+      [],
+      relayState,
+      { send: () => {} },
+    )
+
+    expect(upstreamSocket.sent).toEqual([])
+
+    upstreamSocket.emit('open')
+
+    expect(upstreamSocket.sent).toEqual(['hello-before-open'])
+  })
+
   test('closes websocket on invalid relay path', async () => {
     const relayState = createRelayState()
     const edgeMessages: string[] = []
@@ -343,5 +412,3 @@ describe('agent runtime helpers', () => {
     })
   })
 })
-
-

@@ -5,6 +5,7 @@ export const edgeEnvSchema = z.object({
   ROOT_DOMAIN: z.string().min(1),
   OPERATOR_TOKEN: z.string().min(1),
   STALE_ROUTE_GRACE_MS: z.coerce.number().int().positive().default(30000),
+  HEARTBEAT_GRACE_MS: z.coerce.number().int().positive().default(15000),
 })
 
 export const agentConfigSchema = z.object({

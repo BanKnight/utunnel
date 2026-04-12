@@ -1,5 +1,6 @@
 import { DurableObject } from 'cloudflare:workers'
 import {
+  heartbeatMessageSchema,
   responseEnvelopeSchema,
   websocketCloseSchema,
   websocketFrameSchema,
@@ -11,8 +12,8 @@ import {
   type WebSocketFrameMessage,
   type WebSocketOpenMessage,
 } from '@utunnel/protocol'
-import { app, type EdgeBindings } from './app'
-import { markSessionDisconnected } from './lib'
+import { app, handleTunnelRequest, type EdgeBindings } from './app'
+import { markSessionDisconnected, markSessionHeartbeat } from './lib'
 
 const decoder = new TextDecoder()
 
@@ -202,8 +203,15 @@ export class HostSession extends DurableObject<EdgeBindings> {
       return this.relayHttpRequest((await request.json()) as RelayHttpRequest)
     }
 
-    if (request.method === 'POST' && url.pathname === '/relay-ws') {
-      return this.relayWebSocket(request, (await request.json()) as RelayWebSocketRequest)
+    if (request.method === 'GET' && url.pathname === '/relay-ws') {
+      const relayHeader = request.headers.get('x-utunnel-relay-payload')
+      if (!relayHeader) {
+        return Response.json({ ok: false, reason: 'missing_relay_payload' }, { status: 400 })
+      }
+      return this.relayWebSocket(
+        request,
+        JSON.parse(relayHeader) as RelayWebSocketRequest,
+      )
     }
 
     if (request.method === 'POST' && url.pathname === '/disconnect') {
@@ -242,6 +250,27 @@ export class HostSession extends DurableObject<EdgeBindings> {
     }
 
     if (role.type === 'host') {
+      let heartbeat: { payload: { hostId: string; sessionId: string; timestamp: string } } | null = null
+      try {
+        heartbeat = heartbeatMessageSchema.parse(JSON.parse(text))
+      } catch {}
+
+      if (heartbeat) {
+        const session = await this.ctx.storage.get<HostSessionRecord>('session')
+        if (
+          session &&
+          session.hostId === heartbeat.payload.hostId &&
+          session.sessionId === heartbeat.payload.sessionId &&
+          session.disconnectedAt === null
+        ) {
+          await this.ctx.storage.put(
+            'session',
+            markSessionHeartbeat(session, Date.parse(heartbeat.payload.timestamp)),
+          )
+        }
+        return
+      }
+
       let httpParsed: HttpResponseMessage | null = null
       try {
         httpParsed = responseEnvelopeSchema.parse(JSON.parse(text))
@@ -319,5 +348,11 @@ export class HostSession extends DurableObject<EdgeBindings> {
 }
 
 export default {
-  fetch: app.fetch,
+  fetch(request: Request, env: EdgeBindings, executionCtx: ExecutionContext) {
+    const url = new URL(request.url)
+    if (request.headers.get('Upgrade')?.toLowerCase() === 'websocket' && url.pathname.startsWith('/tunnel/')) {
+      return handleTunnelRequest(request, env)
+    }
+    return app.fetch(request, env, executionCtx)
+  },
 }

@@ -31,6 +31,7 @@ export const hostSessionRecordSchema = z.object({
   version: z.number().int().positive(),
   services: z.array(serviceDefinitionSchema),
   connectedAt: z.number().int().nonnegative(),
+  lastHeartbeatAt: z.number().int().nonnegative(),
   disconnectedAt: z.number().int().nonnegative().nullable().default(null),
 })
 
