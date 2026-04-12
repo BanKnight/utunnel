@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:net'
 import { setTimeout as sleep } from 'node:timers/promises'
@@ -172,6 +173,21 @@ const waitForWebSocketEcho = async (edgePort: number, hostname: string, message:
   throw new Error(`timeout_waiting_for_websocket_echo:${hostname}`)
 }
 
+const buildWebShellIfNeeded = () => {
+  const distIndexPath = '/data/workspace/utunnel/apps/web/dist/index.html'
+  if (existsSync(distIndexPath)) {
+    return
+  }
+
+  const result = Bun.spawnSync(['bun', 'run', '--cwd', '/data/workspace/utunnel/apps/web', 'build'], {
+    stdout: 'inherit',
+    stderr: 'inherit',
+  })
+  if (result.exitCode !== 0) {
+    throw new Error('web_shell_build_failed')
+  }
+}
+
 const main = async () => {
   const runSuffix = String(Date.now())
   const edgePort = await getAvailablePort()
@@ -182,6 +198,8 @@ const main = async () => {
     host3Ws: await getAvailablePort(),
   }
   const edgeBaseUrl = `http://127.0.0.1:${edgePort}`
+
+  buildWebShellIfNeeded()
 
   const upstreamHttp1 = Bun.serve({
     port: servicePorts.host1Http,
@@ -320,6 +338,8 @@ const main = async () => {
     upstreamHttp1.stop(true)
     await demoConfigs.cleanup()
   }
+
+  process.exit(0)
 }
 
 main().catch((error) => {

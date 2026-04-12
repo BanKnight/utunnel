@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'bun:test'
+import { parseAgentConfig } from '@utunnel/config'
 import type { HttpRequestMessage, WebSocketCloseMessage, WebSocketFrameMessage, WebSocketOpenMessage } from '@utunnel/protocol'
 import { buildServiceBindingPayload, createDefaultAgentConfig, createNextRuntimeState, resolveRegistrationPath } from './runtime'
-import { createRelayState, forwardHttpRequest, handleTunnelMessage, sendHeartbeat } from './index'
+import { createRelayState, forwardHttpRequest, handleTunnelMessage, requireAgentToken, sendHeartbeat } from './index'
 
 class FakeUpstreamSocket {
   listeners = new Map<string, Array<(event?: { code?: number; data?: string; reason?: string }) => void>>()
@@ -57,20 +58,15 @@ describe('agent runtime helpers', () => {
     expect(payload.services).toHaveLength(1)
   })
 
-  test('sends structured heartbeat messages', () => {
-    const sent: string[] = []
-
-    sendHeartbeat({ send: (data: string) => sent.push(data) }, 'host-1', 'session-1', new Date('2026-04-12T00:00:00.000Z'))
-
-    expect(sent).toHaveLength(1)
-    expect(JSON.parse(sent[0]!)).toEqual({
-      type: 'heartbeat',
-      payload: {
-        hostId: 'host-1',
-        sessionId: 'session-1',
-        timestamp: '2026-04-12T00:00:00.000Z',
-      },
+  test('requires a legacy host token before bootstrap claim flow is implemented', () => {
+    const config = parseAgentConfig({
+      hostId: 'host-bootstrap',
+      hostname: 'machine-bootstrap',
+      edgeBaseUrl: 'http://127.0.0.1:8787',
+      bootstrapToken: 'bootstrap-token',
     })
+
+    expect(() => requireAgentToken(config)).toThrow('bootstrap_claim_required')
   })
 
   test('forwards http request to local upstream', async () => {

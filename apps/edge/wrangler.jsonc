@@ -8,7 +8,14 @@
     "ROOT_DOMAIN": "example.test",
     "OPERATOR_TOKEN": "dev-operator-token",
     "STALE_ROUTE_GRACE_MS": "30000",
-    "HEARTBEAT_GRACE_MS": "15000"
+    "HEARTBEAT_GRACE_MS": "15000",
+    "UI_PASSWORD": "dev-password",
+    "SESSION_SECRET": "dev-session-secret",
+    "SESSION_TTL_MS": "86400000"
+  },
+  "assets": {
+    "directory": "../web/dist",
+    "binding": "ASSETS"
   },
   "durable_objects": {
     "bindings": [

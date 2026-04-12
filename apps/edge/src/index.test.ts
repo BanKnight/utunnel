@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test'
+import { createTRPCProxyClient, httpBatchLink } from '@trpc/client'
 import { app } from './app'
+import { handleEdgeFetch } from './worker-entry'
 import { buildHostToken } from './lib'
+import type { AppRouter } from './trpc'
 
 type RoutingEntry = {
   hostname: string
@@ -13,6 +16,28 @@ type RoutingEntry = {
 
 class FakeRoutingStub {
   private entries = new Map<string, RoutingEntry>()
+  private desired = new Map<string, HostControlState['desired']>()
+  private current = new Map<string, HostControlState['current']>()
+  private applied = new Map<string, HostControlState['applied']>()
+
+  private readHostState(hostId: string): HostControlState {
+    const applied = this.applied.get(hostId) ?? null
+    return {
+      hostId,
+      desired: this.desired.get(hostId) ?? null,
+      current: this.current.get(hostId) ?? null,
+      applied,
+      projectedRoutes: applied
+        ? applied.services.map((service) => ({
+            hostname: service.subdomain,
+            serviceId: service.serviceId,
+            hostId,
+            generation: applied.generation,
+            projectedAt: applied.appliedAt,
+          }))
+        : [],
+    }
+  }
 
   async fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
     const request = input instanceof Request ? input : new Request(input, init)
@@ -43,6 +68,88 @@ class FakeRoutingStub {
       const { hostname } = (await request.json()) as { hostname: string }
       this.entries.delete(hostname)
       return Response.json({ removed: true })
+    }
+
+    if (request.method === 'GET' && url.pathname === '/control/hosts') {
+      const hostIds = Array.from(new Set([...this.desired.keys(), ...this.current.keys(), ...this.applied.keys()])).sort()
+      return Response.json(hostIds.map((hostId) => this.readHostState(hostId)))
+    }
+
+    if (request.method === 'GET' && url.pathname === '/control/routes') {
+      const hostIds = Array.from(new Set([...this.desired.keys(), ...this.current.keys(), ...this.applied.keys()])).sort()
+      return Response.json(hostIds.flatMap((hostId) => this.readHostState(hostId).projectedRoutes))
+    }
+
+    const controlMatch = url.pathname.match(/^\/control\/hosts\/([^/]+?)(?:\/(desired|current|applied))?$/)
+    if (controlMatch) {
+      const hostId = decodeURIComponent(controlMatch[1]!)
+      const action = controlMatch[2] ?? null
+
+      if (request.method === 'DELETE' && action === null) {
+        this.desired.delete(hostId)
+        this.current.delete(hostId)
+        this.applied.delete(hostId)
+        return Response.json({ ok: true })
+      }
+
+      if (request.method === 'PUT' && action === 'desired') {
+        const body = (await request.json()) as { services: NonNullable<HostControlState['desired']>['services'] }
+        const desired = {
+          hostId,
+          generation: (this.desired.get(hostId)?.generation ?? 0) + 1,
+          services: body.services,
+          updatedAt: Date.now(),
+        }
+        this.desired.set(hostId, desired)
+        return Response.json(desired)
+      }
+
+      if (request.method === 'POST' && action === 'current') {
+        const desired = this.desired.get(hostId)
+        if (!desired) {
+          return Response.json({ ok: false, reason: 'desired_not_found' }, { status: 409 })
+        }
+        const body = (await request.json()) as NonNullable<HostControlState['current']>
+        if (body.generation !== desired.generation) {
+          return Response.json({ ok: false, reason: 'generation_mismatch' }, { status: 409 })
+        }
+        const current = {
+          hostId,
+          generation: body.generation,
+          status: body.status,
+          services: body.services,
+          error: body.error,
+          reportedAt: Date.now(),
+        }
+        this.current.set(hostId, current)
+        return Response.json(current)
+      }
+
+      if (request.method === 'POST' && action === 'applied') {
+        const desired = this.desired.get(hostId)
+        const current = this.current.get(hostId)
+        if (!desired) {
+          return Response.json({ ok: false, reason: 'desired_not_found' }, { status: 409 })
+        }
+        if (!current) {
+          return Response.json({ ok: false, reason: 'current_not_found' }, { status: 409 })
+        }
+        if (current.status !== 'acknowledged') {
+          return Response.json({ ok: false, reason: 'current_not_acknowledged' }, { status: 409 })
+        }
+        const body = (await request.json()) as { generation: number; services: NonNullable<HostControlState['applied']>['services'] }
+        if (body.generation !== desired.generation || body.generation !== current.generation) {
+          return Response.json({ ok: false, reason: 'generation_mismatch' }, { status: 409 })
+        }
+        const applied = {
+          hostId,
+          generation: body.generation,
+          services: body.services,
+          appliedAt: Date.now(),
+        }
+        this.applied.set(hostId, applied)
+        return Response.json(applied)
+      }
     }
 
     return Response.json({ error: 'not_found' }, { status: 404 })
@@ -246,10 +353,24 @@ class FakeHostNamespace {
   }
 }
 
+class FakeAssetsStub {
+  lastPathname: string | null = null
+
+  async fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+    const request = input instanceof Request ? input : new Request(input, init)
+    const url = new URL(request.url)
+    this.lastPathname = url.pathname
+    return new Response(`asset:${url.pathname}`, {
+      headers: { 'content-type': 'text/html' },
+    })
+  }
+}
+
 const createEnv = () => {
   const routingStub = new FakeRoutingStub()
   const routing = new FakeRoutingNamespace(routingStub)
   const hosts = new FakeHostNamespace()
+  const assets = new FakeAssetsStub()
 
   return {
     ROOT_DOMAIN: 'example.test',
@@ -258,10 +379,261 @@ const createEnv = () => {
     HEARTBEAT_GRACE_MS: '1000',
     ROUTING_DIRECTORY: routing,
     HOST_SESSION: hosts,
+    ASSETS: assets,
   }
 }
 
+type HostControlState = {
+  hostId: string
+  desired: {
+    generation: number
+    services: Array<{ serviceId: string; serviceName: string; subdomain: string }>
+  } | null
+  current: {
+    generation: number
+    status: 'pending' | 'acknowledged' | 'error'
+    services: Array<{ serviceId: string; serviceName: string; subdomain: string }>
+    error?: string | undefined
+  } | null
+  applied: {
+    generation: number
+    appliedAt: number
+    services: Array<{ serviceId: string; serviceName: string; subdomain: string }>
+  } | null
+  projectedRoutes: Array<{ hostname: string; serviceId: string; hostId: string; generation: number; projectedAt: number }>
+}
+
 describe('edge app integration', () => {
+  test('serves control shell asset fallback for browser routes', async () => {
+    const env = createEnv()
+    const executionCtx = {
+      waitUntil() {},
+      passThroughOnException() {},
+    }
+
+    const rootResponse = await handleEdgeFetch(new Request('http://edge.test/'), env, executionCtx)
+    const loginResponse = await handleEdgeFetch(new Request('http://edge.test/login'), env, executionCtx)
+
+    expect(rootResponse.status).toBe(200)
+    expect(await rootResponse.text()).toBe('asset:/index.html')
+    expect(loginResponse.status).toBe(200)
+    expect(await loginResponse.text()).toBe('asset:/index.html')
+    expect(env.ASSETS.lastPathname).toBe('/index.html')
+  })
+
+  test('supports control shell tRPC login, me, summary, and logout flow', async () => {
+    const env = {
+      ...createEnv(),
+      UI_PASSWORD: 'console-password',
+      SESSION_SECRET: 'session-secret',
+      SESSION_TTL_MS: '3600000',
+    }
+
+    const registerHost = async (hostId: string, sessionId: string, subdomain: string) => {
+      return app.request(
+        `http://edge.test/api/hosts/${hostId}/services`,
+        {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${buildHostToken(hostId, env.OPERATOR_TOKEN)}`,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            sessionId,
+            version: 1,
+            services: [
+              {
+                serviceId: `${hostId}-svc`,
+                serviceName: hostId,
+                localUrl: 'http://127.0.0.1:3001',
+                protocol: 'http',
+                subdomain,
+              },
+            ],
+          }),
+        },
+        env,
+      )
+    }
+
+    expect(await registerHost('host-1', 'session-1', 'one.example.test')).toHaveProperty('status', 200)
+
+    const executionCtx = { waitUntil() {}, passThroughOnException() {} }
+    let cookieHeader: string | null = null
+    let lastSetCookie: string | null = null
+
+    const client = createTRPCProxyClient<AppRouter>({
+      links: [
+        httpBatchLink({
+          url: 'http://edge.test/trpc',
+          fetch: async (url, options) => {
+            const headers = new Headers(options?.headers)
+            if (cookieHeader) {
+              headers.set('cookie', cookieHeader)
+            }
+
+            const requestInit: RequestInit = {
+              method: options?.method ?? 'GET',
+              headers,
+            }
+            if (options && 'body' in options) {
+              requestInit.body = options.body ?? null
+            }
+
+            const response = await handleEdgeFetch(new Request(String(url), requestInit), env, executionCtx)
+            lastSetCookie = response.headers.get('set-cookie')
+            if (lastSetCookie) {
+              cookieHeader = lastSetCookie.split(';')[0] ?? null
+            }
+            return response
+          },
+        }),
+      ],
+    })
+
+    const loginResult = await client.auth.login.mutate({ password: 'console-password' })
+    expect(loginResult).toEqual({ ok: true, user: { id: 'personal' } })
+    expect(cookieHeader ?? '').toContain('utunnel_session=')
+
+    const meResult = await client.auth.me.query()
+    expect(meResult).toEqual({ ok: true, user: { id: 'personal' } })
+
+    const summaryResult = await client.dashboard.summary.query()
+    expect(summaryResult.hostCount).toBe(1)
+    expect(summaryResult.routeCount).toBe(1)
+
+    const logoutResult = await client.auth.logout.mutate()
+    expect(logoutResult).toEqual({ ok: true })
+    expect(lastSetCookie ?? '').toContain('Max-Age=0')
+  })
+
+
+  test('stores desired state without projecting routes until applied exists', async () => {
+    const env = createEnv()
+    const operatorHeader = {
+      authorization: 'Bearer dev-operator-token',
+      'content-type': 'application/json',
+    }
+
+    const desiredResponse = await app.request(
+      'http://edge.test/api/control/hosts/host-phase2/desired',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({
+          services: [
+            {
+              serviceId: 'svc-phase2',
+              serviceName: 'phase2',
+              localUrl: 'http://127.0.0.1:3301',
+              protocol: 'http',
+              subdomain: 'phase2.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+
+    expect(desiredResponse.status).toBe(200)
+
+    const hostsResponse = await app.request('http://edge.test/api/control/hosts', { headers: operatorHeader }, env)
+    const hosts = (await hostsResponse.json()) as HostControlState[]
+    expect(hostsResponse.status).toBe(200)
+    expect(hosts).toHaveLength(1)
+    expect(hosts[0]?.desired?.generation).toBe(1)
+    expect(hosts[0]?.applied).toBeNull()
+    expect(hosts[0]?.projectedRoutes).toEqual([])
+
+    const routesResponse = await app.request('http://edge.test/api/control/routes', { headers: operatorHeader }, env)
+    const routes = (await routesResponse.json()) as Array<{ hostname: string }>
+    expect(routesResponse.status).toBe(200)
+    expect(routes).toEqual([])
+
+    const legacyRoutesResponse = await app.request('http://edge.test/api/routes', { headers: operatorHeader }, env)
+    const legacyRoutes = (await legacyRoutesResponse.json()) as RoutingEntry[]
+    expect(legacyRoutes).toEqual([])
+  })
+
+  test('projects routes only after current ack and applied promotion', async () => {
+    const env = createEnv()
+    const operatorHeader = {
+      authorization: 'Bearer dev-operator-token',
+      'content-type': 'application/json',
+    }
+
+    const services = [
+      {
+        serviceId: 'svc-phase2-applied',
+        serviceName: 'phase2-applied',
+        localUrl: 'http://127.0.0.1:3302',
+        protocol: 'http' as const,
+        subdomain: 'phase2-applied.example.test',
+      },
+    ]
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-phase2/desired',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ services }),
+      },
+      env,
+    )
+
+    const appliedBeforeAck = await app.request(
+      'http://edge.test/api/control/hosts/host-phase2/applied',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ generation: 1, services }),
+      },
+      env,
+    )
+    expect(appliedBeforeAck.status).toBe(409)
+
+    const currentResponse = await app.request(
+      'http://edge.test/api/control/hosts/host-phase2/current',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({
+          generation: 1,
+          status: 'acknowledged',
+          services,
+        }),
+      },
+      env,
+    )
+    expect(currentResponse.status).toBe(200)
+
+    const appliedResponse = await app.request(
+      'http://edge.test/api/control/hosts/host-phase2/applied',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ generation: 1, services }),
+      },
+      env,
+    )
+    expect(appliedResponse.status).toBe(200)
+
+    const hostsResponse = await app.request('http://edge.test/api/control/hosts', { headers: operatorHeader }, env)
+    const hosts = (await hostsResponse.json()) as HostControlState[]
+    expect(hosts[0]?.current?.status).toBe('acknowledged')
+    expect(hosts[0]?.applied?.generation).toBe(1)
+    expect(hosts[0]?.projectedRoutes[0]?.hostname).toBe('phase2-applied.example.test')
+
+    const routesResponse = await app.request('http://edge.test/api/control/routes', { headers: operatorHeader }, env)
+    const routes = (await routesResponse.json()) as HostControlState['projectedRoutes']
+    expect(routes).toHaveLength(1)
+    expect(routes[0]?.hostname).toBe('phase2-applied.example.test')
+    expect(routes[0]?.serviceId).toBe('svc-phase2-applied')
+    expect(routes[0]?.hostId).toBe('host-phase2')
+    expect(routes[0]?.generation).toBe(1)
+  })
+
   test('rejects unauthorized host mutations', async () => {
     const env = createEnv()
     const response = await app.request(
@@ -1468,5 +1840,154 @@ describe('edge app integration', () => {
     )
 
     expect(rebind.status).toBe(409)
+  })
+
+  test('supports single-user password login and session me/logout flow', async () => {
+    const env = {
+      ...createEnv(),
+      UI_PASSWORD: 'console-password',
+      SESSION_SECRET: 'session-secret',
+      SESSION_TTL_MS: '3600000',
+    }
+
+    const unauthorizedMe = await app.request('http://edge.test/api/auth/me', {}, env)
+    expect(unauthorizedMe.status).toBe(401)
+
+    const login = await app.request(
+      'http://edge.test/api/auth/login',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ password: 'console-password' }),
+      },
+      env,
+    )
+
+    const loginJson = (await login.json()) as {
+      ok: boolean
+      user: { id: string }
+    }
+    const sessionCookie = login.headers.get('set-cookie')
+
+    expect(login.status).toBe(200)
+    expect(loginJson).toEqual({ ok: true, user: { id: 'personal' } })
+    expect(sessionCookie).toContain('utunnel_session=')
+    expect(sessionCookie).toContain('HttpOnly')
+
+    const me = await app.request(
+      'http://edge.test/api/auth/me',
+      {
+        headers: { cookie: sessionCookie! },
+      },
+      env,
+    )
+    const meJson = (await me.json()) as {
+      ok: boolean
+      user: { id: string }
+    }
+
+    expect(me.status).toBe(200)
+    expect(meJson).toEqual({ ok: true, user: { id: 'personal' } })
+
+    const logout = await app.request(
+      'http://edge.test/api/auth/logout',
+      {
+        method: 'POST',
+        headers: { cookie: sessionCookie! },
+      },
+      env,
+    )
+    const logoutJson = (await logout.json()) as { ok: boolean }
+    const clearedCookie = logout.headers.get('set-cookie')
+
+    expect(logout.status).toBe(200)
+    expect(logoutJson).toEqual({ ok: true })
+    expect(clearedCookie).toContain('utunnel_session=')
+  })
+
+  test('returns session-protected dashboard summary from routes and health state', async () => {
+    const env = {
+      ...createEnv(),
+      UI_PASSWORD: 'console-password',
+      SESSION_SECRET: 'session-secret',
+      SESSION_TTL_MS: '3600000',
+    }
+
+    const registerHost = async (hostId: string, sessionId: string, subdomain: string) => {
+      return app.request(
+        `http://edge.test/api/hosts/${hostId}/services`,
+        {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${buildHostToken(hostId, env.OPERATOR_TOKEN)}`,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            sessionId,
+            version: 1,
+            services: [
+              {
+                serviceId: `${hostId}-svc`,
+                serviceName: hostId,
+                localUrl: 'http://127.0.0.1:3001',
+                protocol: 'http',
+                subdomain,
+              },
+            ],
+          }),
+        },
+        env,
+      )
+    }
+
+    expect(await registerHost('host-1', 'session-1', 'one.example.test')).toHaveProperty('status', 200)
+    expect(await registerHost('host-2', 'session-2', 'two.example.test')).toHaveProperty('status', 200)
+
+    const disconnectedHost = env.HOST_SESSION.get('host-2')
+    disconnectedHost.session = {
+      ...disconnectedHost.session!,
+      disconnectedAt: Date.now(),
+      lastHeartbeatAt: Date.now() - 10_000,
+    }
+
+    const login = await app.request(
+      'http://edge.test/api/auth/login',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ password: 'console-password' }),
+      },
+      env,
+    )
+    const sessionCookie = login.headers.get('set-cookie')
+
+    const summary = await app.request(
+      'http://edge.test/api/dashboard/summary',
+      {
+        headers: { cookie: sessionCookie! },
+      },
+      env,
+    )
+    const summaryJson = (await summary.json()) as {
+      hostCount: number
+      onlineHostCount: number
+      routeCount: number
+      unhealthyHostCount: number
+      recentHosts: Array<{
+        hostId: string
+        healthy: boolean
+        disconnectedAt: number | null
+      }>
+    }
+
+    expect(summary.status).toBe(200)
+    expect(summaryJson.hostCount).toBe(2)
+    expect(summaryJson.onlineHostCount).toBe(1)
+    expect(summaryJson.routeCount).toBe(2)
+    expect(summaryJson.unhealthyHostCount).toBe(1)
+    expect(summaryJson.recentHosts.map((host) => [host.hostId, host.healthy])).toEqual([
+      ['host-2', false],
+      ['host-1', true],
+    ])
   })
 })

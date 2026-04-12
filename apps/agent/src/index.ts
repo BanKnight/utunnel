@@ -53,11 +53,20 @@ const loadConfig = async () => {
   return parseAgentConfig(await file.json())
 }
 
+export const requireAgentToken = (config: AgentConfig): string => {
+  if (config.token) {
+    return config.token
+  }
+
+  throw new Error('bootstrap_claim_required')
+}
+
 const verifyHostToken = async (config: AgentConfig) => {
+  const token = requireAgentToken(config)
   const verifyResponse = await fetch(`${config.edgeBaseUrl}/api/hosts/${config.hostId}/token/verify`, {
     method: 'POST',
     headers: {
-      authorization: `Bearer ${config.token}`,
+      authorization: `Bearer ${token}`,
     },
   })
 
@@ -381,11 +390,13 @@ const attachRelayHandlers = (socket: WebSocket, services: ServiceDefinition[]) =
 }
 
 const runAgentCycle = async (config: AgentConfig, state: RuntimeState) => {
+  const token = requireAgentToken(config)
+
   await verifyHostToken(config)
-  const socket = await connectHostSession(config.edgeBaseUrl, config.hostId, config.token)
+  const socket = await connectHostSession(config.edgeBaseUrl, config.hostId, token)
   attachRelayHandlers(socket, config.services)
   const heartbeat = startHeartbeat(socket, config.hostId, state.sessionId)
-  const registration = await registerServices(config.edgeBaseUrl, config.hostId, state, config.services, config.token)
+  const registration = await registerServices(config.edgeBaseUrl, config.hostId, state, config.services, token)
 
   console.log(
     JSON.stringify(
