@@ -50,6 +50,19 @@ type HostAccessTokenRecord = {
   issuedAt: number
 }
 
+type ControlApiTokenRecord = {
+  tokenId: string
+  prefix: string
+  tokenHash: string
+  label?: string
+  createdAt: number
+  rotatedAt: number | null
+  revokedAt: number | null
+  lastUsedAt: number | null
+}
+
+type ControlApiTokenMetadata = Omit<ControlApiTokenRecord, 'tokenHash'>
+
 type HostControlState = {
   hostId: string
   bootstrap: BootstrapState | null
@@ -97,6 +110,42 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
 
   private hostTokenKey(hostId: string) {
     return `host-token:${hostId}`
+  }
+
+  private apiTokenKey(tokenId: string) {
+    return `api-token:${tokenId}`
+  }
+
+  private async hashToken(token: string) {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token))
+    return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+  }
+
+  private buildApiTokenValue() {
+    return `utapi_${crypto.randomUUID().replace(/-/g, '')}`
+  }
+
+  private toApiTokenMetadata(record: ControlApiTokenRecord): ControlApiTokenMetadata {
+    const { tokenHash: _tokenHash, ...metadata } = record
+    return metadata
+  }
+
+  private async listApiTokens() {
+    const entries = await this.ctx.storage.list<ControlApiTokenRecord>({ prefix: 'api-token:' })
+    return Array.from(entries.values())
+      .map((record) => this.toApiTokenMetadata(record))
+      .sort((left, right) => right.createdAt - left.createdAt)
+  }
+
+  private async findApiTokenByValue(token: string) {
+    const tokenHash = await this.hashToken(token)
+    const entries = await this.ctx.storage.list<ControlApiTokenRecord>({ prefix: 'api-token:' })
+    for (const record of entries.values()) {
+      if (record.revokedAt === null && record.tokenHash === tokenHash) {
+        return record
+      }
+    }
+    return null
   }
 
   private buildProjectedRoutes(applied: AppliedHostConfig | null): AppliedRouteProjection[] {
@@ -168,6 +217,11 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
     )
   }
 
+  private async listAppliedRouteProjections(): Promise<AppliedRouteProjection[]> {
+    const states = await this.listHostControlStates()
+    return states.flatMap((state) => state.projectedRoutes)
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url)
 
@@ -213,6 +267,106 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
 
     if (request.method === 'GET' && url.pathname === '/control/hosts') {
       return Response.json(await this.listHostControlStates())
+    }
+
+    if (request.method === 'GET' && url.pathname === '/control/routes') {
+      return Response.json(await this.listAppliedRouteProjections())
+    }
+
+    if (request.method === 'GET' && url.pathname === '/control/tokens') {
+      return Response.json(await this.listApiTokens())
+    }
+
+    if (request.method === 'POST' && url.pathname === '/control/tokens') {
+      const body = (await request.json().catch(() => null)) as { label?: string } | null
+      const label = body?.label?.trim() ? body.label.trim() : undefined
+      const token = this.buildApiTokenValue()
+      const createdAt = Date.now()
+      const record: ControlApiTokenRecord = label
+        ? {
+            tokenId: crypto.randomUUID(),
+            prefix: token.slice(0, 12),
+            tokenHash: await this.hashToken(token),
+            label,
+            createdAt,
+            rotatedAt: null,
+            revokedAt: null,
+            lastUsedAt: null,
+          }
+        : {
+            tokenId: crypto.randomUUID(),
+            prefix: token.slice(0, 12),
+            tokenHash: await this.hashToken(token),
+            createdAt,
+            rotatedAt: null,
+            revokedAt: null,
+            lastUsedAt: null,
+          }
+      await this.ctx.storage.put(this.apiTokenKey(record.tokenId), record)
+      return Response.json({
+        ...this.toApiTokenMetadata(record),
+        token,
+      })
+    }
+
+    if (request.method === 'POST' && url.pathname === '/control/tokens/verify') {
+      const body = (await request.json().catch(() => null)) as { token?: string } | null
+      if (!body?.token) {
+        return Response.json({ ok: false })
+      }
+
+      const record = await this.findApiTokenByValue(body.token)
+      if (!record) {
+        return Response.json({ ok: false })
+      }
+
+      const updatedRecord = {
+        ...record,
+        lastUsedAt: Date.now(),
+      } satisfies ControlApiTokenRecord
+      await this.ctx.storage.put(this.apiTokenKey(record.tokenId), updatedRecord)
+      return Response.json({ ok: true, tokenId: record.tokenId })
+    }
+
+    const controlTokenMatch = url.pathname.match(/^\/control\/tokens\/([^/]+?)\/(rotate|revoke)$/)
+    if (controlTokenMatch && request.method === 'POST') {
+      const tokenId = decodeURIComponent(controlTokenMatch[1] ?? '')
+      const action = controlTokenMatch[2]
+      if (!tokenId) {
+        return Response.json({ ok: false, reason: 'token_id_required' }, { status: 400 })
+      }
+
+      const record = await this.ctx.storage.get<ControlApiTokenRecord>(this.apiTokenKey(tokenId))
+      if (!record) {
+        return Response.json({ ok: false, reason: 'token_not_found' }, { status: 404 })
+      }
+
+      if (action === 'rotate') {
+        if (record.revokedAt !== null) {
+          return Response.json({ ok: false, reason: 'token_revoked' }, { status: 409 })
+        }
+
+        const token = this.buildApiTokenValue()
+        const rotatedRecord = {
+          ...record,
+          prefix: token.slice(0, 12),
+          tokenHash: await this.hashToken(token),
+          rotatedAt: Date.now(),
+          lastUsedAt: null,
+        } satisfies ControlApiTokenRecord
+        await this.ctx.storage.put(this.apiTokenKey(tokenId), rotatedRecord)
+        return Response.json({
+          ...this.toApiTokenMetadata(rotatedRecord),
+          token,
+        })
+      }
+
+      const revokedRecord = {
+        ...record,
+        revokedAt: record.revokedAt ?? Date.now(),
+      } satisfies ControlApiTokenRecord
+      await this.ctx.storage.put(this.apiTokenKey(tokenId), revokedRecord)
+      return Response.json(this.toApiTokenMetadata(revokedRecord))
     }
 
     const bootstrapMatch = url.pathname.match(/^\/control\/hosts\/([^/]+?)\/bootstrap$/)

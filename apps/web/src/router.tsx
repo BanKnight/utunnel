@@ -40,6 +40,20 @@ type BootstrapIssueResult = {
   command: string
 }
 
+type ControlApiTokenMetadata = {
+  tokenId: string
+  prefix: string
+  label?: string
+  createdAt: number
+  rotatedAt: number | null
+  revokedAt: number | null
+  lastUsedAt: number | null
+}
+
+type ControlApiTokenSecret = ControlApiTokenMetadata & {
+  token: string
+}
+
 type ControlPlaneHost = {
   hostId: string
   bootstrap: {
@@ -293,11 +307,22 @@ function DashboardPage() {
 
 function HostsPage() {
   const hosts = hostsRoute.useLoaderData() as ControlPlaneHost[]
+  const [tokens, setTokens] = useState<ControlApiTokenMetadata[]>([])
   const [hostId, setHostId] = useState('')
   const [hostname, setHostname] = useState('')
+  const [importJson, setImportJson] = useState('')
   const [command, setCommand] = useState<string | null>(null)
+  const [tokenSecret, setTokenSecret] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [issuing, setIssuing] = useState(false)
+  const [creatingToken, setCreatingToken] = useState(false)
+  const [importing, setImporting] = useState(false)
+
+  useEffect(() => {
+    void trpcClient.tokens.list.query().then((result) => setTokens(result as ControlApiTokenMetadata[])).catch(() => {
+      setTokens([])
+    })
+  }, [])
 
   return (
     <div className="space-y-6">
@@ -343,6 +368,118 @@ function HostsPage() {
             <pre className="overflow-x-auto whitespace-pre-wrap text-xs text-slate-200">{command}</pre>
           </div>
         ) : null}
+      </Card>
+      <Card className="space-y-4">
+        <div>
+          <h3 className="text-lg font-medium text-slate-50">API Tokens</h3>
+          <p className="text-sm text-slate-400">Phase 5 增加最小 programmatic control-plane token 管理。</p>
+        </div>
+        <div className="flex flex-wrap gap-3">
+          <Button
+            type="button"
+            disabled={creatingToken}
+            onClick={async () => {
+              setCreatingToken(true)
+              setError(null)
+              try {
+                const created = (await trpcClient.tokens.create.mutate({})) as ControlApiTokenSecret
+                setTokenSecret(created.token)
+                setTokens(await trpcClient.tokens.list.query() as ControlApiTokenMetadata[])
+              } catch {
+                setError('创建 API token 失败。')
+              } finally {
+                setCreatingToken(false)
+              }
+            }}
+          >
+            {creatingToken ? '创建中...' : '创建 token'}
+          </Button>
+        </div>
+        {tokenSecret ? (
+          <div className="rounded-md border border-slate-800 bg-slate-950 p-4">
+            <p className="mb-2 text-sm text-slate-400">One-time token secret</p>
+            <pre className="overflow-x-auto whitespace-pre-wrap text-xs text-slate-200">{tokenSecret}</pre>
+          </div>
+        ) : null}
+        <div className="space-y-3">
+          {tokens.length > 0 ? tokens.map((token) => (
+            <div key={token.tokenId} className="flex items-center justify-between rounded-md border border-slate-800 px-4 py-3">
+              <div>
+                <p className="font-medium text-slate-100">{token.label ?? token.prefix}</p>
+                <p className="text-sm text-slate-400">{token.prefix} · {token.revokedAt ? 'revoked' : 'active'}</p>
+              </div>
+              <div className="flex gap-2">
+                <Button
+                  type="button"
+                  className="bg-slate-800 text-slate-100 hover:bg-slate-700"
+                  onClick={async () => {
+                    setError(null)
+                    try {
+                      const rotated = (await trpcClient.tokens.rotate.mutate({ tokenId: token.tokenId })) as ControlApiTokenSecret
+                      setTokenSecret(rotated.token)
+                      setTokens(await trpcClient.tokens.list.query() as ControlApiTokenMetadata[])
+                    } catch {
+                      setError('轮换 token 失败。')
+                    }
+                  }}
+                >
+                  rotate
+                </Button>
+                <Button
+                  type="button"
+                  className="bg-slate-800 text-slate-100 hover:bg-slate-700"
+                  onClick={async () => {
+                    setError(null)
+                    try {
+                      await trpcClient.tokens.revoke.mutate({ tokenId: token.tokenId })
+                      setTokens(await trpcClient.tokens.list.query() as ControlApiTokenMetadata[])
+                    } catch {
+                      setError('撤销 token 失败。')
+                    }
+                  }}
+                >
+                  revoke
+                </Button>
+              </div>
+            </div>
+          )) : <p className="text-sm text-slate-500">暂无 API tokens</p>}
+        </div>
+      </Card>
+      <Card className="space-y-4">
+        <div>
+          <h3 className="text-lg font-medium text-slate-50">导入 static config</h3>
+          <p className="text-sm text-slate-400">把旧静态 service 配置导入到 desired.services，并立即触发现有 dispatch。</p>
+        </div>
+        <form
+          className="space-y-3"
+          onSubmit={async (event) => {
+            event.preventDefault()
+            setImporting(true)
+            setError(null)
+            try {
+              const parsed = JSON.parse(importJson) as { services?: Array<{ serviceId: string; serviceName: string; localUrl: string; protocol: 'http' | 'websocket'; subdomain: string }> }
+              await trpcClient.hosts.importStaticConfig.mutate({
+                hostId,
+                services: parsed.services ?? [],
+              })
+            } catch {
+              setError('导入 static config 失败。')
+            } finally {
+              setImporting(false)
+            }
+          }}
+        >
+          <Input placeholder="target host id" value={hostId} onChange={(event) => setHostId(event.target.value)} />
+          <textarea
+            className="min-h-40 w-full rounded-md border border-slate-800 bg-slate-950 p-3 text-sm text-slate-100"
+            placeholder='{"services":[...]}'
+            value={importJson}
+            onChange={(event) => setImportJson(event.target.value)}
+          />
+          <Button type="submit" disabled={importing || hostId.length === 0 || importJson.length === 0}>
+            {importing ? '导入中...' : '导入 static config'}
+          </Button>
+        </form>
       </Card>
       <div className="space-y-4">
         {hosts.map((host) => (

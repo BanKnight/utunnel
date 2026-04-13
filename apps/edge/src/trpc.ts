@@ -7,7 +7,15 @@ import {
   logoutControlShell,
   summarizeDashboard,
 } from './control-shell'
-import { listControlPlaneHosts, issueHostBootstrap, upsertDesiredHostServices } from './control-plane'
+import {
+  applyDesiredHostServices,
+  createControlApiToken,
+  listControlApiTokens,
+  listControlPlaneHosts,
+  issueHostBootstrap,
+  revokeControlApiToken,
+  rotateControlApiToken,
+} from './control-plane'
 import type { EdgeBindings } from './types'
 
 export type TrpcContext = {
@@ -97,7 +105,54 @@ export const appRouter = t.router({
         }),
       )
       .mutation(async ({ ctx, input }) => {
-        const result = await upsertDesiredHostServices(ctx.env, input.hostId, input.services)
+        const result = await applyDesiredHostServices(ctx.env, input.hostId, input.services)
+        if (!result.ok) {
+          throw new TRPCError({ code: 'BAD_REQUEST', message: result.reason })
+        }
+        return result.value
+      }),
+    importStaticConfig: protectedProcedure
+      .input(
+        z.object({
+          hostId: z.string().min(1),
+          services: z.array(serviceDefinitionSchema),
+        }),
+      )
+      .mutation(async ({ ctx, input }) => {
+        const result = await applyDesiredHostServices(ctx.env, input.hostId, input.services)
+        if (!result.ok) {
+          throw new TRPCError({ code: 'BAD_REQUEST', message: result.reason })
+        }
+        return result.value
+      }),
+  }),
+  tokens: t.router({
+    list: protectedProcedure.query(async ({ ctx }) => {
+      return listControlApiTokens(ctx.env)
+    }),
+    create: protectedProcedure
+      .input(z.object({ label: z.string().min(1).optional() }))
+      .mutation(async ({ ctx, input }) => {
+        const createInput = input.label ? { label: input.label } : {}
+        const result = await createControlApiToken(ctx.env, createInput)
+        if (!result.ok) {
+          throw new TRPCError({ code: 'BAD_REQUEST', message: result.reason })
+        }
+        return result.value
+      }),
+    rotate: protectedProcedure
+      .input(z.object({ tokenId: z.string().min(1) }))
+      .mutation(async ({ ctx, input }) => {
+        const result = await rotateControlApiToken(ctx.env, input.tokenId)
+        if (!result.ok) {
+          throw new TRPCError({ code: 'BAD_REQUEST', message: result.reason })
+        }
+        return result.value
+      }),
+    revoke: protectedProcedure
+      .input(z.object({ tokenId: z.string().min(1) }))
+      .mutation(async ({ ctx, input }) => {
+        const result = await revokeControlApiToken(ctx.env, input.tokenId)
         if (!result.ok) {
           throw new TRPCError({ code: 'BAD_REQUEST', message: result.reason })
         }

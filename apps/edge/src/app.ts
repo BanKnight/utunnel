@@ -31,15 +31,21 @@ import {
   summarizeDashboard,
 } from './control-shell'
 import {
+  applyDesiredHostServices,
+  createControlApiToken,
   deleteHostControlState,
   claimHostBootstrap,
   getDesiredHostConfig,
+  getHostControlState,
   issueHostBootstrap,
   listAppliedRouteProjections,
+  listControlApiTokens,
   listControlPlaneHosts,
   promoteAppliedHostConfig,
   reportCurrentHostConfig,
-  upsertDesiredHostServices,
+  revokeControlApiToken,
+  rotateControlApiToken,
+  verifyControlApiToken,
   verifyHostAccessToken,
 } from './control-plane'
 import { attachTrpc } from './trpc-handler'
@@ -72,9 +78,12 @@ const requireHostAuthorization = async (request: Request, hostId: string, env: E
   return isHostAuthorized(token, hostId, env.OPERATOR_TOKEN)
 }
 
-const requireOperatorAuthorization = (request: Request, env: EdgeBindings) => {
+const requireOperatorAuthorization = async (request: Request, env: EdgeBindings) => {
   const token = extractBearerToken(request.headers.get('authorization'))
-  return isOperatorAuthorized(token, env.OPERATOR_TOKEN)
+  if (isOperatorAuthorized(token, env.OPERATOR_TOKEN)) {
+    return true
+  }
+  return verifyControlApiToken(env, token)
 }
 
 const parseAndValidatePayload = async (request: Request, env: EdgeBindings) => {
@@ -91,20 +100,6 @@ const parseAndValidatePayload = async (request: Request, env: EdgeBindings) => {
     ...rawPayload,
     services,
   } satisfies ServiceBindingPayload
-}
-
-const parseDesiredServicesInput = async (request: Request, env: EdgeBindings) => {
-  const body = (await request.json().catch(() => null)) as { services?: unknown } | null
-  const services = z.array(serviceDefinitionSchema).parse(body?.services ?? [])
-  const normalizedServices = normalizeServiceDefinitions(services)
-
-  for (const service of normalizedServices) {
-    if (!isHostnameInRootDomain(service.subdomain, env.ROOT_DOMAIN)) {
-      throw new Error(`service_outside_root_domain:${service.subdomain}`)
-    }
-  }
-
-  return normalizedServices
 }
 
 const dispatchDesiredConfigToHost = async (env: EdgeBindings, hostId: string) => {
@@ -369,18 +364,16 @@ export const createEdgeApp = () => {
   })
 
   app.post('/api/control/hosts/:hostId/desired', async (c) => {
-    if (!requireOperatorAuthorization(c.req.raw, c.env)) {
+    if (!(await requireOperatorAuthorization(c.req.raw, c.env))) {
       return unauthorized('invalid_operator_token')
     }
 
     const hostId = c.req.param('hostId')
     try {
-      const services = await parseDesiredServicesInput(c.req.raw, c.env)
-      const result = await upsertDesiredHostServices(c.env, hostId, services)
+      const result = await applyDesiredHostServices(c.env, hostId, (await c.req.json().catch(() => null))?.services ?? [])
       if (!result.ok) {
         return Response.json({ ok: false, reason: result.reason }, { status: result.status })
       }
-      await dispatchDesiredConfigToHost(c.env, hostId)
       return c.json(result.value)
     } catch (error) {
       return badRequest(error instanceof Error ? error.message : 'invalid_desired_payload')
@@ -388,7 +381,7 @@ export const createEdgeApp = () => {
   })
 
   app.post('/api/control/hosts/:hostId/bootstrap', async (c) => {
-    if (!requireOperatorAuthorization(c.req.raw, c.env)) {
+    if (!(await requireOperatorAuthorization(c.req.raw, c.env))) {
       return unauthorized('invalid_operator_token')
     }
 
@@ -415,7 +408,7 @@ export const createEdgeApp = () => {
   })
 
   app.post('/api/control/hosts/:hostId/current', async (c) => {
-    if (!requireOperatorAuthorization(c.req.raw, c.env)) {
+    if (!(await requireOperatorAuthorization(c.req.raw, c.env))) {
       return unauthorized('invalid_operator_token')
     }
 
@@ -444,7 +437,7 @@ export const createEdgeApp = () => {
   })
 
   app.post('/api/control/hosts/:hostId/applied', async (c) => {
-    if (!requireOperatorAuthorization(c.req.raw, c.env)) {
+    if (!(await requireOperatorAuthorization(c.req.raw, c.env))) {
       return unauthorized('invalid_operator_token')
     }
 
@@ -468,16 +461,92 @@ export const createEdgeApp = () => {
     }
   })
 
+  app.get('/api/control/hosts/:hostId', async (c) => {
+    if (!(await requireOperatorAuthorization(c.req.raw, c.env))) {
+      return unauthorized('invalid_operator_token')
+    }
+
+    const hostId = c.req.param('hostId')
+    const state = await getHostControlState(c.env, hostId)
+    if (!state) {
+      return Response.json({ ok: false, reason: 'host_not_found' }, { status: 404 })
+    }
+
+    const edgeEnv = parseEdgeEnv(c.env)
+    const sessionResponse = await getHostStub(c.env, hostId).fetch('https://host.internal/session')
+    const session = (await sessionResponse.json()) as HostSessionRecord | null
+
+    return c.json({
+      ...state,
+      runtime: session
+        ? {
+            sessionId: session.sessionId,
+            version: session.version,
+            healthy: isSessionHealthy(session, edgeEnv.HEARTBEAT_GRACE_MS),
+            lastHeartbeatAt: session.lastHeartbeatAt,
+            disconnectedAt: session.disconnectedAt,
+            serviceCount: session.services.length,
+          }
+        : null,
+    })
+  })
+
   app.get('/api/control/hosts', async (c) => {
-    if (!requireOperatorAuthorization(c.req.raw, c.env)) {
+    if (!(await requireOperatorAuthorization(c.req.raw, c.env))) {
       return unauthorized('invalid_operator_token')
     }
 
     return c.json(await listControlPlaneHosts(c.env))
   })
 
+  app.get('/api/control/tokens', async (c) => {
+    if (!(await requireOperatorAuthorization(c.req.raw, c.env))) {
+      return unauthorized('invalid_operator_token')
+    }
+
+    return c.json(await listControlApiTokens(c.env))
+  })
+
+  app.post('/api/control/tokens', async (c) => {
+    if (!(await requireOperatorAuthorization(c.req.raw, c.env))) {
+      return unauthorized('invalid_operator_token')
+    }
+
+    const body = (await c.req.json().catch(() => null)) as { label?: string } | null
+    const input = body?.label ? { label: body.label } : {}
+    const result = await createControlApiToken(c.env, input)
+    if (!result.ok) {
+      return Response.json({ ok: false, reason: result.reason }, { status: result.status })
+    }
+    return c.json(result.value)
+  })
+
+  app.post('/api/control/tokens/:tokenId/rotate', async (c) => {
+    if (!(await requireOperatorAuthorization(c.req.raw, c.env))) {
+      return unauthorized('invalid_operator_token')
+    }
+
+    const result = await rotateControlApiToken(c.env, c.req.param('tokenId'))
+    if (!result.ok) {
+      return Response.json({ ok: false, reason: result.reason }, { status: result.status })
+    }
+    return c.json(result.value)
+  })
+
+  app.post('/api/control/tokens/:tokenId/revoke', async (c) => {
+    if (!(await requireOperatorAuthorization(c.req.raw, c.env))) {
+      return unauthorized('invalid_operator_token')
+    }
+
+    const result = await revokeControlApiToken(c.env, c.req.param('tokenId'))
+    if (!result.ok) {
+      return Response.json({ ok: false, reason: result.reason }, { status: result.status })
+    }
+    return c.json(result.value)
+  })
+
   app.delete('/api/control/hosts/:hostId', async (c) => {
-    if (!requireOperatorAuthorization(c.req.raw, c.env)) {
+    if (!(await requireOperatorAuthorization(c.req.raw, c.env))) {
       return unauthorized('invalid_operator_token')
     }
 
@@ -491,7 +560,7 @@ export const createEdgeApp = () => {
 
 
   app.get('/api/control/routes', async (c) => {
-    if (!requireOperatorAuthorization(c.req.raw, c.env)) {
+    if (!(await requireOperatorAuthorization(c.req.raw, c.env))) {
       return unauthorized('invalid_operator_token')
     }
 
@@ -708,7 +777,7 @@ export const createEdgeApp = () => {
   })
 
   app.get('/api/routes/resolve', async (c) => {
-    if (!requireOperatorAuthorization(c.req.raw, c.env)) {
+    if (!(await requireOperatorAuthorization(c.req.raw, c.env))) {
       return unauthorized('invalid_operator_token')
     }
 
@@ -722,7 +791,7 @@ export const createEdgeApp = () => {
   })
 
   app.get('/api/routes', async (c) => {
-    if (!requireOperatorAuthorization(c.req.raw, c.env)) {
+    if (!(await requireOperatorAuthorization(c.req.raw, c.env))) {
       return unauthorized('invalid_operator_token')
     }
 
@@ -731,7 +800,7 @@ export const createEdgeApp = () => {
   })
 
   app.get('/api/hosts/:hostId/session', async (c) => {
-    if (!requireOperatorAuthorization(c.req.raw, c.env)) {
+    if (!(await requireOperatorAuthorization(c.req.raw, c.env))) {
       return unauthorized('invalid_operator_token')
     }
 
@@ -740,7 +809,7 @@ export const createEdgeApp = () => {
   })
 
   app.get('/api/hosts/:hostId/health', async (c) => {
-    if (!requireOperatorAuthorization(c.req.raw, c.env)) {
+    if (!(await requireOperatorAuthorization(c.req.raw, c.env))) {
       return unauthorized('invalid_operator_token')
     }
 
