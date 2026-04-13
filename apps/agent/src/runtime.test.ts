@@ -1,8 +1,22 @@
 import { describe, expect, test } from 'bun:test'
 import { parseAgentConfig } from '@utunnel/config'
-import type { HttpRequestMessage, WebSocketCloseMessage, WebSocketFrameMessage, WebSocketOpenMessage } from '@utunnel/protocol'
+import type {
+  HttpRequestMessage,
+  WebSocketCloseMessage,
+  WebSocketFrameMessage,
+  WebSocketOpenMessage,
+} from '@utunnel/protocol'
 import { buildServiceBindingPayload, createDefaultAgentConfig, createNextRuntimeState, resolveRegistrationPath } from './runtime'
-import { createRelayState, forwardHttpRequest, handleTunnelMessage, requireAgentToken, sendHeartbeat } from './index'
+import {
+  claimBootstrapToken,
+  createRelayState,
+  forwardHttpRequest,
+  handleAgentSocketMessage,
+  handleTunnelMessage,
+  requireAgentToken,
+  sendHeartbeat,
+  type AgentRuntimeContext,
+} from './index'
 
 class FakeUpstreamSocket {
   listeners = new Map<string, Array<(event?: { code?: number; data?: string; reason?: string }) => void>>()
@@ -67,6 +81,33 @@ describe('agent runtime helpers', () => {
     })
 
     expect(() => requireAgentToken(config)).toThrow('bootstrap_claim_required')
+  })
+
+  test('claims bootstrap token and returns issued host token', async () => {
+    const config = parseAgentConfig({
+      hostId: 'host-bootstrap',
+      hostname: 'machine-bootstrap',
+      edgeBaseUrl: 'http://edge.test',
+      bootstrapToken: 'bootstrap-token',
+    })
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? input : new Request(input, init)
+      expect(request.url).toBe('http://edge.test/api/bootstrap/claim')
+      expect(await request.json()).toEqual({
+        hostId: 'host-bootstrap',
+        hostname: 'machine-bootstrap',
+        bootstrapToken: 'bootstrap-token',
+      })
+      return Response.json({ ok: true, token: 'host-issued-token' })
+    }) as typeof fetch
+
+    try {
+      await expect(claimBootstrapToken(config)).resolves.toBe('host-issued-token')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
   })
 
   test('forwards http request to local upstream', async () => {
@@ -319,7 +360,6 @@ describe('agent runtime helpers', () => {
     })
   })
 
-
   test('queues websocket frames until upstream socket opens', async () => {
     const relayState = createRelayState()
     const upstreamSocket = new FakeUpstreamSocket()
@@ -406,5 +446,98 @@ describe('agent runtime helpers', () => {
         reason: 'invalid_relay_path',
       },
     })
+  })
+
+  test('applies config_dispatch and sends reconcile acknowledgements without polluting relay state', async () => {
+    const runtime: AgentRuntimeContext = {
+      activeServices: [
+        {
+          serviceId: 'svc-old',
+          serviceName: 'old',
+          localUrl: 'http://127.0.0.1:3001',
+          protocol: 'http',
+          subdomain: 'old.example.test',
+        },
+      ],
+      appliedGeneration: null,
+    }
+    const state = createNextRuntimeState()
+    const config = parseAgentConfig({
+      hostId: 'host-1',
+      hostname: 'host-1',
+      token: 'host-token',
+      edgeBaseUrl: 'http://edge.test',
+      services: runtime.activeServices,
+    })
+    const edgeMessages: string[] = []
+
+    const originalFetch = globalThis.fetch
+    const fetchCalls: Array<{ url: string; body: unknown }> = []
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? input : new Request(input, init)
+      fetchCalls.push({ url: request.url, body: await request.json() })
+      return Response.json({ ok: true, mode: 'rebind' })
+    }) as typeof fetch
+
+    try {
+      await handleAgentSocketMessage(
+        JSON.stringify({
+          type: 'config_dispatch',
+          payload: {
+            hostId: 'host-1',
+            generation: 3,
+            desired: {
+              hostId: 'host-1',
+              generation: 3,
+              updatedAt: Date.now(),
+              services: [
+                {
+                  serviceId: 'svc-new',
+                  serviceName: 'new',
+                  localUrl: 'http://127.0.0.1:3101',
+                  protocol: 'http',
+                  subdomain: 'new.example.test',
+                },
+              ],
+            },
+            dispatchedAt: Date.now(),
+            idempotencyKey: 'dispatch-1',
+          },
+        }),
+        runtime,
+        state,
+        config,
+        { send: (data: string) => edgeMessages.push(data) },
+        createRelayState(),
+        'host-token',
+      )
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+
+    expect(fetchCalls).toHaveLength(1)
+    expect(fetchCalls[0]?.url).toContain('/api/hosts/host-1/services')
+    expect(runtime.appliedGeneration).toBe(3)
+    expect(runtime.activeServices.map((service) => service.serviceId)).toEqual(['svc-new'])
+    expect(edgeMessages.map((item) => JSON.parse(item))).toEqual([
+      {
+        type: 'reconcile_ack',
+        payload: {
+          hostId: 'host-1',
+          generation: 3,
+          status: 'acknowledged',
+          acknowledgedAt: expect.any(Number),
+        },
+      },
+      {
+        type: 'reconcile_ack',
+        payload: {
+          hostId: 'host-1',
+          generation: 3,
+          status: 'applied',
+          acknowledgedAt: expect.any(Number),
+        },
+      },
+    ])
   })
 })

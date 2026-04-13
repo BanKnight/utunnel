@@ -9,6 +9,7 @@ import {
   serviceBindingPayloadSchema,
   type RoutingEntry,
   type ServiceBindingPayload,
+  configDispatchMessageSchema,
 } from '@utunnel/protocol'
 import {
   buildHostSessionRecord,
@@ -31,11 +32,15 @@ import {
 } from './control-shell'
 import {
   deleteHostControlState,
+  claimHostBootstrap,
+  getDesiredHostConfig,
+  issueHostBootstrap,
   listAppliedRouteProjections,
   listControlPlaneHosts,
   promoteAppliedHostConfig,
   reportCurrentHostConfig,
   upsertDesiredHostServices,
+  verifyHostAccessToken,
 } from './control-plane'
 import { attachTrpc } from './trpc-handler'
 import type { EdgeBindings, FetchStub, HonoEnv } from './types'
@@ -59,8 +64,11 @@ const getHostStub = (env: EdgeBindings, hostId: string) => {
   return env.HOST_SESSION.get(env.HOST_SESSION.idFromName(hostId))
 }
 
-const requireHostAuthorization = (request: Request, hostId: string, env: EdgeBindings) => {
+const requireHostAuthorization = async (request: Request, hostId: string, env: EdgeBindings) => {
   const token = extractBearerToken(request.headers.get('authorization'))
+  if (await verifyHostAccessToken(env, hostId, token)) {
+    return true
+  }
   return isHostAuthorized(token, hostId, env.OPERATOR_TOKEN)
 }
 
@@ -97,6 +105,35 @@ const parseDesiredServicesInput = async (request: Request, env: EdgeBindings) =>
   }
 
   return normalizedServices
+}
+
+const dispatchDesiredConfigToHost = async (env: EdgeBindings, hostId: string) => {
+  const desired = await getDesiredHostConfig(env, hostId)
+  if (!desired) {
+    return { ok: true as const, dispatched: false as const }
+  }
+
+  const message = configDispatchMessageSchema.parse({
+    type: 'config_dispatch',
+    payload: {
+      hostId,
+      generation: desired.generation,
+      desired,
+      dispatchedAt: Date.now(),
+      idempotencyKey: crypto.randomUUID(),
+    },
+  })
+
+  const hostStub = getHostStub(env, hostId)
+  const response = await hostStub.fetch(
+    toJsonRequest('https://host.internal/control/dispatch', message),
+  )
+
+  if (!response.ok) {
+    return { ok: false as const, status: response.status }
+  }
+
+  return { ok: true as const, dispatched: true as const, generation: desired.generation }
 }
 
 const pruneRemovedHostRoutes = async (routing: FetchStub, hostId: string, keepHostnames: string[]) => {
@@ -343,9 +380,37 @@ export const createEdgeApp = () => {
       if (!result.ok) {
         return Response.json({ ok: false, reason: result.reason }, { status: result.status })
       }
+      await dispatchDesiredConfigToHost(c.env, hostId)
       return c.json(result.value)
     } catch (error) {
       return badRequest(error instanceof Error ? error.message : 'invalid_desired_payload')
+    }
+  })
+
+  app.post('/api/control/hosts/:hostId/bootstrap', async (c) => {
+    if (!requireOperatorAuthorization(c.req.raw, c.env)) {
+      return unauthorized('invalid_operator_token')
+    }
+
+    const hostId = c.req.param('hostId')
+    try {
+      const body = (await c.req.json().catch(() => null)) as {
+        hostname?: string
+        edgeBaseUrl?: string
+        expiresInMs?: number
+      } | null
+      const hostname = z.string().min(1).parse(body?.hostname)
+      const edgeBaseUrl = z.string().url().parse(body?.edgeBaseUrl)
+      const bootstrapInput = body?.expiresInMs === undefined
+        ? { hostId, hostname, edgeBaseUrl }
+        : { hostId, hostname, edgeBaseUrl, expiresInMs: body.expiresInMs }
+      const result = await issueHostBootstrap(c.env, bootstrapInput)
+      if (!result.ok) {
+        return Response.json({ ok: false, reason: result.reason }, { status: result.status })
+      }
+      return c.json(result.value)
+    } catch (error) {
+      return badRequest(error instanceof Error ? error.message : 'invalid_bootstrap_payload')
     }
   })
 
@@ -433,9 +498,42 @@ export const createEdgeApp = () => {
     return c.json(await listAppliedRouteProjections(c.env))
   })
 
+  app.post('/api/bootstrap/claim', async (c) => {
+    try {
+      const body = (await c.req.json().catch(() => null)) as {
+        hostId?: string
+        hostname?: string
+        bootstrapToken?: string
+      } | null
+      const hostId = z.string().min(1).parse(body?.hostId)
+      const hostname = z.string().min(1).parse(body?.hostname)
+      const bootstrapToken = z.string().min(1).parse(body?.bootstrapToken)
+      const result = await claimHostBootstrap(c.env, {
+        hostId,
+        hostname,
+        bootstrapToken,
+      })
+      if (!result.ok) {
+        return Response.json({ ok: false, reason: result.reason }, { status: result.status })
+      }
+      return c.json(result.value)
+    } catch (error) {
+      return badRequest(error instanceof Error ? error.message : 'invalid_bootstrap_claim')
+    }
+  })
+
+  app.get('/api/hosts/:hostId/desired', async (c) => {
+    const hostId = c.req.param('hostId')
+    if (!(await requireHostAuthorization(c.req.raw, hostId, c.env))) {
+      return unauthorized('invalid_host_token')
+    }
+
+    return c.json({ desired: await getDesiredHostConfig(c.env, hostId) })
+  })
+
   app.post('/api/hosts/:hostId/token/verify', async (c) => {
     const hostId = c.req.param('hostId')
-    if (!requireHostAuthorization(c.req.raw, hostId, c.env)) {
+    if (!(await requireHostAuthorization(c.req.raw, hostId, c.env))) {
       return unauthorized('invalid_host_token')
     }
 
@@ -448,7 +546,7 @@ export const createEdgeApp = () => {
     if (c.req.header('Upgrade') !== 'websocket') {
       return new Response('Expected WebSocket', { status: 426 })
     }
-    if (!requireHostAuthorization(c.req.raw, hostId, c.env)) {
+    if (!(await requireHostAuthorization(c.req.raw, hostId, c.env))) {
       return unauthorized('invalid_host_token')
     }
 
@@ -458,7 +556,7 @@ export const createEdgeApp = () => {
 
   app.post('/api/hosts/:hostId/services', async (c) => {
     const hostId = c.req.param('hostId')
-    if (!requireHostAuthorization(c.req.raw, hostId, c.env)) {
+    if (!(await requireHostAuthorization(c.req.raw, hostId, c.env))) {
       return unauthorized('invalid_host_token')
     }
 
@@ -497,12 +595,13 @@ export const createEdgeApp = () => {
       return pruneResponse
     }
 
+    await dispatchDesiredConfigToHost(c.env, hostId)
     return c.json({ ok: true, count: payload.services.length, mode: 'register' })
   })
 
   app.post('/api/hosts/:hostId/rebind', async (c) => {
     const hostId = c.req.param('hostId')
-    if (!requireHostAuthorization(c.req.raw, hostId, c.env)) {
+    if (!(await requireHostAuthorization(c.req.raw, hostId, c.env))) {
       return unauthorized('invalid_host_token')
     }
 
@@ -561,12 +660,13 @@ export const createEdgeApp = () => {
       return pruneResponse
     }
 
+    await dispatchDesiredConfigToHost(c.env, hostId)
     return c.json({ ok: true, count: payload.services.length, mode: 'rebind' })
   })
 
   app.post('/api/hosts/:hostId/disconnect', async (c) => {
     const hostId = c.req.param('hostId')
-    if (!requireHostAuthorization(c.req.raw, hostId, c.env)) {
+    if (!(await requireHostAuthorization(c.req.raw, hostId, c.env))) {
       return unauthorized('invalid_host_token')
     }
 
@@ -576,7 +676,7 @@ export const createEdgeApp = () => {
 
   app.post('/api/hosts/:hostId/cleanup-stale', async (c) => {
     const hostId = c.req.param('hostId')
-    if (!requireHostAuthorization(c.req.raw, hostId, c.env)) {
+    if (!(await requireHostAuthorization(c.req.raw, hostId, c.env))) {
       return unauthorized('invalid_host_token')
     }
 

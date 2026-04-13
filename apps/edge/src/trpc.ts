@@ -7,7 +7,7 @@ import {
   logoutControlShell,
   summarizeDashboard,
 } from './control-shell'
-import { listControlPlaneHosts, upsertDesiredHostServices } from './control-plane'
+import { listControlPlaneHosts, issueHostBootstrap, upsertDesiredHostServices } from './control-plane'
 import type { EdgeBindings } from './types'
 
 export type TrpcContext = {
@@ -74,6 +74,21 @@ export const appRouter = t.router({
     list: protectedProcedure.query(async ({ ctx }) => {
       return listControlPlaneHosts(ctx.env)
     }),
+    issueBootstrap: protectedProcedure
+      .input(
+        z.object({
+          hostId: z.string().min(1),
+          hostname: z.string().min(1),
+          edgeBaseUrl: z.string().url(),
+        }),
+      )
+      .mutation(async ({ ctx, input }) => {
+        const result = await issueHostBootstrap(ctx.env, input)
+        if (!result.ok) {
+          throw new TRPCError({ code: 'BAD_REQUEST', message: result.reason })
+        }
+        return result.value
+      }),
     upsertDesired: protectedProcedure
       .input(
         z.object({

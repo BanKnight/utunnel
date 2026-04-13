@@ -16,14 +16,25 @@ type RoutingEntry = {
 
 class FakeRoutingStub {
   private entries = new Map<string, RoutingEntry>()
+  private bootstrap = new Map<string, { hostId: string; hostname: string; bootstrapToken: string; issuedAt: number; expiresAt: number; claimedAt: number | null }>()
+  private hostTokens = new Map<string, { token: string; issuedAt: number }>()
   private desired = new Map<string, HostControlState['desired']>()
   private current = new Map<string, HostControlState['current']>()
   private applied = new Map<string, HostControlState['applied']>()
 
   private readHostState(hostId: string): HostControlState {
     const applied = this.applied.get(hostId) ?? null
+    const bootstrap = this.bootstrap.get(hostId) ?? null
     return {
       hostId,
+      bootstrap: bootstrap
+        ? {
+            hostname: bootstrap.hostname,
+            issuedAt: bootstrap.issuedAt,
+            expiresAt: bootstrap.expiresAt,
+            claimedAt: bootstrap.claimedAt,
+          }
+        : null,
       desired: this.desired.get(hostId) ?? null,
       current: this.current.get(hostId) ?? null,
       applied,
@@ -71,13 +82,64 @@ class FakeRoutingStub {
     }
 
     if (request.method === 'GET' && url.pathname === '/control/hosts') {
-      const hostIds = Array.from(new Set([...this.desired.keys(), ...this.current.keys(), ...this.applied.keys()])).sort()
+      const hostIds = Array.from(new Set([...this.bootstrap.keys(), ...this.desired.keys(), ...this.current.keys(), ...this.applied.keys()])).sort()
       return Response.json(hostIds.map((hostId) => this.readHostState(hostId)))
     }
 
     if (request.method === 'GET' && url.pathname === '/control/routes') {
-      const hostIds = Array.from(new Set([...this.desired.keys(), ...this.current.keys(), ...this.applied.keys()])).sort()
+      const hostIds = Array.from(new Set([...this.bootstrap.keys(), ...this.desired.keys(), ...this.current.keys(), ...this.applied.keys()])).sort()
       return Response.json(hostIds.flatMap((hostId) => this.readHostState(hostId).projectedRoutes))
+    }
+
+    const bootstrapMatch = url.pathname.match(/^\/control\/hosts\/([^/]+?)\/bootstrap$/)
+    if (bootstrapMatch && request.method === 'POST') {
+      const hostId = decodeURIComponent(bootstrapMatch[1]!)
+      const body = (await request.json()) as { hostname: string; expiresInMs?: number }
+      const issuedAt = Date.now()
+      const record = {
+        hostId,
+        hostname: body.hostname,
+        bootstrapToken: `bootstrap-${hostId}`,
+        issuedAt,
+        expiresAt: issuedAt + (body.expiresInMs ?? 10 * 60 * 1000),
+        claimedAt: null,
+      }
+      this.bootstrap.set(hostId, record)
+      return Response.json(record)
+    }
+
+    const claimMatch = url.pathname.match(/^\/control\/hosts\/([^/]+?)\/claim$/)
+    if (claimMatch && request.method === 'POST') {
+      const hostId = decodeURIComponent(claimMatch[1]!)
+      const body = (await request.json()) as { hostname: string; bootstrapToken: string }
+      const bootstrap = this.bootstrap.get(hostId)
+      if (!bootstrap) {
+        return Response.json({ ok: false, reason: 'bootstrap_not_found' }, { status: 404 })
+      }
+      if (bootstrap.claimedAt !== null) {
+        return Response.json({ ok: false, reason: 'bootstrap_already_used' }, { status: 409 })
+      }
+      if (Date.now() > bootstrap.expiresAt) {
+        return Response.json({ ok: false, reason: 'bootstrap_expired' }, { status: 409 })
+      }
+      if (body.hostname !== bootstrap.hostname) {
+        return Response.json({ ok: false, reason: 'hostname_mismatch' }, { status: 409 })
+      }
+      if (body.bootstrapToken !== bootstrap.bootstrapToken) {
+        return Response.json({ ok: false, reason: 'invalid_bootstrap_token' }, { status: 401 })
+      }
+      const claimedAt = Date.now()
+      bootstrap.claimedAt = claimedAt
+      const token = `host-token-${hostId}`
+      this.hostTokens.set(hostId, { token, issuedAt: claimedAt })
+      return Response.json({ ok: true, hostId, token, claimedAt })
+    }
+
+    const hostTokenVerifyMatch = url.pathname.match(/^\/control\/hosts\/([^/]+?)\/token\/verify$/)
+    if (hostTokenVerifyMatch && request.method === 'POST') {
+      const hostId = decodeURIComponent(hostTokenVerifyMatch[1]!)
+      const body = (await request.json()) as { token: string }
+      return Response.json({ ok: body.token === this.hostTokens.get(hostId)?.token })
     }
 
     const controlMatch = url.pathname.match(/^\/control\/hosts\/([^/]+?)(?:\/(desired|current|applied))?$/)
@@ -86,6 +148,8 @@ class FakeRoutingStub {
       const action = controlMatch[2] ?? null
 
       if (request.method === 'DELETE' && action === null) {
+        this.bootstrap.delete(hostId)
+        this.hostTokens.delete(hostId)
         this.desired.delete(hostId)
         this.current.delete(hostId)
         this.applied.delete(hostId)
@@ -385,6 +449,12 @@ const createEnv = () => {
 
 type HostControlState = {
   hostId: string
+  bootstrap: {
+    hostname: string
+    issuedAt: number
+    expiresAt: number
+    claimedAt: number | null
+  } | null
   desired: {
     generation: number
     services: Array<{ serviceId: string; serviceName: string; subdomain: string }>
@@ -507,6 +577,118 @@ describe('edge app integration', () => {
     expect(lastSetCookie ?? '').toContain('Max-Age=0')
   })
 
+
+  test('issues bootstrap command, claims host, and rejects reuse', async () => {
+    const env = createEnv()
+    const operatorHeader = {
+      authorization: 'Bearer dev-operator-token',
+      'content-type': 'application/json',
+    }
+
+    const issueResponse = await app.request(
+      'http://edge.test/api/control/hosts/host-bootstrap/bootstrap',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({
+          hostname: 'machine-bootstrap',
+          edgeBaseUrl: 'http://edge.test',
+        }),
+      },
+      env,
+    )
+    const issueJson = (await issueResponse.json()) as { bootstrapToken: string; command: string }
+
+    expect(issueResponse.status).toBe(200)
+    expect(issueJson.bootstrapToken).toBeTypeOf('string')
+    expect(issueJson.command).toContain('bootstrapToken')
+
+    const claimResponse = await app.request(
+      'http://edge.test/api/bootstrap/claim',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          hostId: 'host-bootstrap',
+          hostname: 'machine-bootstrap',
+          bootstrapToken: issueJson.bootstrapToken,
+        }),
+      },
+      env,
+    )
+    const claimJson = (await claimResponse.json()) as { ok: true; token: string }
+
+    expect(claimResponse.status).toBe(200)
+    expect(claimJson.token).toBeTypeOf('string')
+
+    const verifyResponse = await app.request(
+      'http://edge.test/api/hosts/host-bootstrap/token/verify',
+      {
+        method: 'POST',
+        headers: { authorization: `Bearer ${claimJson.token}` },
+      },
+      env,
+    )
+    expect(verifyResponse.status).toBe(200)
+
+    const reuseResponse = await app.request(
+      'http://edge.test/api/bootstrap/claim',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          hostId: 'host-bootstrap',
+          hostname: 'machine-bootstrap',
+          bootstrapToken: issueJson.bootstrapToken,
+        }),
+      },
+      env,
+    )
+
+    expect(reuseResponse.status).toBe(409)
+  })
+
+  test('rejects expired bootstrap claim', async () => {
+    const env = createEnv()
+    const operatorHeader = {
+      authorization: 'Bearer dev-operator-token',
+      'content-type': 'application/json',
+    }
+
+    const issueResponse = await app.request(
+      'http://edge.test/api/control/hosts/host-expired/bootstrap',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({
+          hostname: 'machine-expired',
+          edgeBaseUrl: 'http://edge.test',
+          expiresInMs: 1,
+        }),
+      },
+      env,
+    )
+    const issueJson = (await issueResponse.json()) as { bootstrapToken: string }
+    expect(issueResponse.status).toBe(200)
+
+    await Bun.sleep(5)
+
+    const claimResponse = await app.request(
+      'http://edge.test/api/bootstrap/claim',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          hostId: 'host-expired',
+          hostname: 'machine-expired',
+          bootstrapToken: issueJson.bootstrapToken,
+        }),
+      },
+      env,
+    )
+
+    expect(claimResponse.status).toBe(409)
+  })
 
   test('stores desired state without projecting routes until applied exists', async () => {
     const env = createEnv()

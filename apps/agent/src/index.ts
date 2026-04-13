@@ -1,6 +1,7 @@
 import { parseAgentConfig } from '@utunnel/config'
 import type { AgentConfig } from '@utunnel/config'
 import type {
+  ControlPlaneMessage,
   HttpRequestMessage,
   HttpResponseMessage,
   ServiceDefinition,
@@ -9,7 +10,7 @@ import type {
   WebSocketFrameMessage,
   WebSocketOpenMessage,
 } from '@utunnel/protocol'
-import { tunnelMessageSchema } from '@utunnel/protocol'
+import { controlPlaneMessageSchema, tunnelMessageSchema } from '@utunnel/protocol'
 import {
   buildServiceBindingPayload,
   createDefaultAgentConfig,
@@ -17,6 +18,8 @@ import {
   resolveRegistrationPath,
 } from './runtime'
 import type { RuntimeState } from './runtime'
+
+type ConfigDispatchMessage = Extract<ControlPlaneMessage, { type: 'config_dispatch' }>
 
 type EdgeSocketLike = {
   send(data: string): void
@@ -42,6 +45,11 @@ export type RelayState = {
   openWebSocketStreams: Set<string>
 }
 
+export type AgentRuntimeContext = {
+  activeServices: ServiceDefinition[]
+  appliedGeneration: number | null
+}
+
 const loadConfig = async () => {
   const configPath = process.env.UTUNNEL_AGENT_CONFIG ?? new URL('../agent.config.json', import.meta.url)
   const file = Bun.file(configPath)
@@ -53,6 +61,31 @@ const loadConfig = async () => {
   return parseAgentConfig(await file.json())
 }
 
+export const claimBootstrapToken = async (config: AgentConfig) => {
+  if (!config.bootstrapToken) {
+    throw new Error('bootstrap_claim_required')
+  }
+
+  const response = await fetch(`${config.edgeBaseUrl}/api/bootstrap/claim`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      hostId: config.hostId,
+      hostname: config.hostname,
+      bootstrapToken: config.bootstrapToken,
+    }),
+  })
+
+  if (!response.ok) {
+    throw new Error(`bootstrap_claim_failed:${response.status}`)
+  }
+
+  const json = (await response.json()) as { ok: true; token: string }
+  return json.token
+}
+
 export const requireAgentToken = (config: AgentConfig): string => {
   if (config.token) {
     return config.token
@@ -61,9 +94,8 @@ export const requireAgentToken = (config: AgentConfig): string => {
   throw new Error('bootstrap_claim_required')
 }
 
-const verifyHostToken = async (config: AgentConfig) => {
-  const token = requireAgentToken(config)
-  const verifyResponse = await fetch(`${config.edgeBaseUrl}/api/hosts/${config.hostId}/token/verify`, {
+const verifyHostToken = async (edgeBaseUrl: string, hostId: string, token: string) => {
+  const verifyResponse = await fetch(`${edgeBaseUrl}/api/hosts/${hostId}/token/verify`, {
     method: 'POST',
     headers: {
       authorization: `Bearer ${token}`,
@@ -103,6 +135,28 @@ const registerServices = async (
   }
 
   return response.json()
+}
+
+const fetchDesiredConfig = async (edgeBaseUrl: string, hostId: string, token: string) => {
+  const response = await fetch(`${edgeBaseUrl}/api/hosts/${hostId}/desired`, {
+    method: 'GET',
+    headers: {
+      authorization: `Bearer ${token}`,
+    },
+  })
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch desired config: ${response.status}`)
+  }
+
+  const json = (await response.json()) as {
+    desired: {
+      generation: number
+      services: ServiceDefinition[]
+    } | null
+  }
+
+  return json.desired
 }
 
 const connectHostSession = async (edgeBaseUrl: string, hostId: string, token: string) => {
@@ -370,7 +424,105 @@ export const handleTunnelMessage = async (
   }
 }
 
-const attachRelayHandlers = (socket: WebSocket, services: ServiceDefinition[]) => {
+const sendReconcileAck = (
+  socket: EdgeSocketLike,
+  hostId: string,
+  generation: number,
+  status: 'acknowledged' | 'applied' | 'error',
+  error?: string,
+) => {
+  socket.send(
+    JSON.stringify({
+      type: 'reconcile_ack',
+      payload: {
+        hostId,
+        generation,
+        status,
+        acknowledgedAt: Date.now(),
+        ...(error ? { error } : {}),
+      },
+    }),
+  )
+}
+
+const applyDesiredConfig = async (
+  config: AgentConfig,
+  runtimeState: RuntimeState,
+  runtime: AgentRuntimeContext,
+  socket: EdgeSocketLike,
+  dispatch: ConfigDispatchMessage,
+  token: string,
+) => {
+  if (dispatch.payload.hostId !== config.hostId) {
+    return
+  }
+
+  if (runtime.appliedGeneration === dispatch.payload.generation) {
+    sendReconcileAck(socket, config.hostId, dispatch.payload.generation, 'applied')
+    return
+  }
+
+  sendReconcileAck(socket, config.hostId, dispatch.payload.generation, 'acknowledged')
+
+  try {
+    await registerServices(
+      config.edgeBaseUrl,
+      config.hostId,
+      runtimeState,
+      dispatch.payload.desired.services,
+      token,
+    )
+    runtime.activeServices = dispatch.payload.desired.services
+    runtime.appliedGeneration = dispatch.payload.generation
+    sendReconcileAck(socket, config.hostId, dispatch.payload.generation, 'applied')
+  } catch (error) {
+    sendReconcileAck(
+      socket,
+      config.hostId,
+      dispatch.payload.generation,
+      'error',
+      error instanceof Error ? error.message : 'apply_failed',
+    )
+  }
+}
+
+export const handleAgentSocketMessage = async (
+  rawMessage: string,
+  runtime: AgentRuntimeContext,
+  runtimeState: RuntimeState,
+  config: AgentConfig,
+  edgeSocket: EdgeSocketLike,
+  relayState: RelayState,
+  token: string,
+  openSocket: CreateUpstreamSocket = createUpstreamSocket,
+) => {
+  let controlMessage: ControlPlaneMessage | null = null
+  try {
+    controlMessage = controlPlaneMessageSchema.parse(JSON.parse(rawMessage))
+  } catch {}
+
+  if (controlMessage?.type === 'config_dispatch') {
+    await applyDesiredConfig(config, runtimeState, runtime, edgeSocket, controlMessage, token)
+    return
+  }
+
+  let tunnelMessage: TunnelMessage
+  try {
+    tunnelMessage = tunnelMessageSchema.parse(JSON.parse(rawMessage))
+  } catch {
+    return
+  }
+
+  await handleTunnelMessage(tunnelMessage, runtime.activeServices, relayState, edgeSocket, openSocket)
+}
+
+const attachSocketHandlers = (
+  socket: WebSocket,
+  config: AgentConfig,
+  runtimeState: RuntimeState,
+  runtime: AgentRuntimeContext,
+  token: string,
+) => {
   const relayState = createRelayState()
 
   socket.addEventListener('message', async (event) => {
@@ -378,25 +530,32 @@ const attachRelayHandlers = (socket: WebSocket, services: ServiceDefinition[]) =
       return
     }
 
-    let parsed: TunnelMessage
-    try {
-      parsed = tunnelMessageSchema.parse(JSON.parse(event.data))
-    } catch {
-      return
-    }
-
-    await handleTunnelMessage(parsed, services, relayState, socket)
+    await handleAgentSocketMessage(
+      event.data,
+      runtime,
+      runtimeState,
+      config,
+      socket,
+      relayState,
+      token,
+    )
   })
 }
 
 const runAgentCycle = async (config: AgentConfig, state: RuntimeState) => {
-  const token = requireAgentToken(config)
+  const token = config.token ?? await claimBootstrapToken(config)
+  await verifyHostToken(config.edgeBaseUrl, config.hostId, token)
 
-  await verifyHostToken(config)
+  const desired = await fetchDesiredConfig(config.edgeBaseUrl, config.hostId, token)
+  const runtime: AgentRuntimeContext = {
+    activeServices: desired?.services ?? config.services,
+    appliedGeneration: desired?.generation ?? null,
+  }
+
   const socket = await connectHostSession(config.edgeBaseUrl, config.hostId, token)
-  attachRelayHandlers(socket, config.services)
+  attachSocketHandlers(socket, config, state, runtime, token)
   const heartbeat = startHeartbeat(socket, config.hostId, state.sessionId)
-  const registration = await registerServices(config.edgeBaseUrl, config.hostId, state, config.services, token)
+  const registration = await registerServices(config.edgeBaseUrl, config.hostId, state, runtime.activeServices, token)
 
   console.log(
     JSON.stringify(
@@ -405,7 +564,7 @@ const runAgentCycle = async (config: AgentConfig, state: RuntimeState) => {
         sessionId: state.sessionId,
         version: state.version,
         previousSessionId: state.previousSessionId ?? null,
-        registeredServices: config.services.map((service) => service.subdomain),
+        registeredServices: runtime.activeServices.map((service) => service.subdomain),
         registration,
       },
       null,
