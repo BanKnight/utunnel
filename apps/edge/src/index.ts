@@ -251,7 +251,7 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
     const states = await this.listHostControlStates()
     const summaries = await Promise.all(
       states.flatMap((state) =>
-        this.collectServices(state).map((service) => this.buildServiceReachabilitySummary(state.hostId, service)),
+        (state.applied?.services ?? []).map((service) => this.buildServiceReachabilitySummary(state.hostId, service)),
       ),
     )
 
@@ -321,8 +321,16 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
           continue
         }
 
-        const result = await this.executeServiceProbe(state.hostId, service)
-        await this.recordProbeResult(result)
+        try {
+          const result = await this.executeServiceProbe(state.hostId, service)
+          await this.recordProbeResult(result)
+        } catch (error) {
+          console.error('reachability_probe_failed', {
+            hostId: state.hostId,
+            serviceId: service.serviceId,
+            reason: error instanceof Error ? error.message : 'unknown_error',
+          })
+        }
       }
     }
   }
@@ -771,8 +779,15 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
   }
 
   async alarm() {
-    await this.runReachabilityProbePass()
-    this.scheduleNextProbeRun()
+    try {
+      await this.runReachabilityProbePass()
+    } catch (error) {
+      console.error('reachability_alarm_failed', {
+        reason: error instanceof Error ? error.message : 'unknown_error',
+      })
+    } finally {
+      this.scheduleNextProbeRun()
+    }
   }
 }
 

@@ -462,6 +462,15 @@ export const listServiceReachabilitySummaries = async (
   const edgeEnv = parseEdgeEnv(env)
   const controlStates = await listHostControlStates(env)
   const stateByHostId = new Map(controlStates.map((state) => [state.hostId, state]))
+  const hostIds = Array.from(new Set(controlStates.map((state) => state.hostId)))
+  const hostSessions = await Promise.all(
+    hostIds.map(async (hostId) => {
+      const hostSessionResponse = await getHostStub(env, hostId).fetch('https://host.internal/session')
+      const session = (await readJson<HostSessionRecord | null>(hostSessionResponse)) ?? null
+      return [hostId, session] as const
+    }),
+  )
+  const sessionByHostId = new Map(hostSessions)
   const response = await getControlPlaneStub(env).fetch('https://routing.internal/control/services/reachability')
   const summaries = await readJson<
     Array<{
@@ -478,38 +487,35 @@ export const listServiceReachabilitySummaries = async (
     }>
   >(response)
 
-  return Promise.all(
-    summaries.map(async (summary) => {
-      const state = stateByHostId.get(summary.hostId) ?? null
-      const hostSessionResponse = await getHostStub(env, summary.hostId).fetch('https://host.internal/session')
-      const session = (await readJson<HostSessionRecord | null>(hostSessionResponse)) ?? null
+  return summaries.map((summary) => {
+    const state = stateByHostId.get(summary.hostId) ?? null
+    const session = sessionByHostId.get(summary.hostId) ?? null
 
-      return {
-        ...summary,
-        hasProjectedRoute:
-          state?.projectedRoutes.some((route) => route.serviceId === summary.serviceId && route.hostname === summary.subdomain) ?? false,
-        desiredGeneration: state?.desired?.services.some((service) => service.serviceId === summary.serviceId)
-          ? state.desired?.generation ?? null
-          : null,
-        currentGeneration: state?.current?.services.some((service) => service.serviceId === summary.serviceId)
-          ? state.current?.generation ?? null
-          : null,
-        currentStatus: state?.current?.services.some((service) => service.serviceId === summary.serviceId)
-          ? state.current?.status ?? null
-          : null,
-        appliedGeneration: state?.applied?.services.some((service) => service.serviceId === summary.serviceId)
-          ? state.applied?.generation ?? null
-          : null,
-        runtime: session
-          ? {
-              healthy: isSessionHealthy(session, edgeEnv.HEARTBEAT_GRACE_MS),
-              lastHeartbeatAt: session.lastHeartbeatAt,
-              disconnectedAt: session.disconnectedAt,
-            }
-          : null,
-      } satisfies ControlPlaneServiceReachabilitySummary
-    }),
-  )
+    return {
+      ...summary,
+      hasProjectedRoute:
+        state?.projectedRoutes.some((route) => route.serviceId === summary.serviceId && route.hostname === summary.subdomain) ?? false,
+      desiredGeneration: state?.desired?.services.some((service) => service.serviceId === summary.serviceId)
+        ? state.desired?.generation ?? null
+        : null,
+      currentGeneration: state?.current?.services.some((service) => service.serviceId === summary.serviceId)
+        ? state.current?.generation ?? null
+        : null,
+      currentStatus: state?.current?.services.some((service) => service.serviceId === summary.serviceId)
+        ? state.current?.status ?? null
+        : null,
+      appliedGeneration: state?.applied?.services.some((service) => service.serviceId === summary.serviceId)
+        ? state.applied?.generation ?? null
+        : null,
+      runtime: session
+        ? {
+            healthy: isSessionHealthy(session, edgeEnv.HEARTBEAT_GRACE_MS),
+            lastHeartbeatAt: session.lastHeartbeatAt,
+            disconnectedAt: session.disconnectedAt,
+          }
+        : null,
+    } satisfies ControlPlaneServiceReachabilitySummary
+  })
 }
 
 export const listControlPlaneHosts = async (env: EdgeBindings): Promise<ControlPlaneHost[]> => {

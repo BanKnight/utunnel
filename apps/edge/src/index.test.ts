@@ -99,7 +99,7 @@ class FakeRoutingStub {
       return Response.json(
         hostIds.flatMap((hostId) => {
           const state = this.readHostState(hostId)
-          const services = state.applied?.services ?? state.current?.services ?? state.desired?.services ?? []
+          const services = state.applied?.services ?? []
           return services.map((service) => {
             const recentResults = this.probeResults.get(`${hostId}:${service.serviceId}`) ?? []
             const lastSuccess = recentResults.find((result) => result.success) ?? null
@@ -582,18 +582,18 @@ type HostControlState = {
   } | null
   desired: {
     generation: number
-    services: Array<{ serviceId: string; serviceName: string; subdomain: string }>
+    services: Array<{ serviceId: string; serviceName: string; subdomain: string; protocol: 'http' | 'websocket' }>
   } | null
   current: {
     generation: number
     status: 'pending' | 'acknowledged' | 'error'
-    services: Array<{ serviceId: string; serviceName: string; subdomain: string }>
+    services: Array<{ serviceId: string; serviceName: string; subdomain: string; protocol: 'http' | 'websocket' }>
     error?: string | undefined
   } | null
   applied: {
     generation: number
     appliedAt: number
-    services: Array<{ serviceId: string; serviceName: string; subdomain: string }>
+    services: Array<{ serviceId: string; serviceName: string; subdomain: string; protocol: 'http' | 'websocket' }>
   } | null
   projectedRoutes: Array<{ hostname: string; serviceId: string; hostId: string; generation: number; projectedAt: number }>
 }
