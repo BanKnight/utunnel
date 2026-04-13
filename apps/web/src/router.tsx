@@ -54,6 +54,16 @@ type ControlApiTokenSecret = ControlApiTokenMetadata & {
   token: string
 }
 
+type ServiceProtocol = 'http' | 'websocket'
+
+type ControlPlaneService = {
+  serviceId: string
+  serviceName: string
+  localUrl: string
+  protocol: ServiceProtocol
+  subdomain: string
+}
+
 type ControlPlaneHost = {
   hostId: string
   bootstrap: {
@@ -64,17 +74,17 @@ type ControlPlaneHost = {
   } | null
   desired: {
     generation: number
-    services: Array<{ serviceId: string; serviceName: string; subdomain: string }>
+    services: ControlPlaneService[]
   } | null
   current: {
     generation: number
     status: 'pending' | 'acknowledged' | 'error'
-    services: Array<{ serviceId: string; serviceName: string; subdomain: string }>
+    services: ControlPlaneService[]
     error?: string
   } | null
   applied: {
     generation: number
-    services: Array<{ serviceId: string; serviceName: string; subdomain: string }>
+    services: ControlPlaneService[]
   } | null
   projectedRoutes: Array<{ hostname: string; serviceId: string; generation: number }>
   runtime: {
@@ -85,6 +95,34 @@ type ControlPlaneHost = {
     disconnectedAt: number | null
     serviceCount: number
   } | null
+}
+
+type HostNotice = {
+  tone: 'error' | 'success'
+  text: string
+}
+
+const cloneServices = (services: ControlPlaneService[] | null | undefined) => {
+  return (services ?? []).map((service) => ({ ...service }))
+}
+
+const buildEditableServices = (host: ControlPlaneHost) => {
+  return cloneServices(host.desired?.services ?? host.current?.services ?? host.applied?.services)
+}
+
+const buildHostEditors = (hosts: ControlPlaneHost[]) => {
+  return Object.fromEntries(hosts.map((host) => [host.hostId, buildEditableServices(host)])) as Record<string, ControlPlaneService[]>
+}
+
+const createDraftService = (hostId: string): ControlPlaneService => {
+  const suffix = Date.now()
+  return {
+    serviceId: `${hostId}-svc-${suffix}`,
+    serviceName: '',
+    localUrl: 'http://127.0.0.1:3000',
+    protocol: 'http',
+    subdomain: '',
+  }
 }
 
 const rootRoute = createRootRouteWithContext<RouterContext>()({
@@ -306,7 +344,11 @@ function DashboardPage() {
 }
 
 function HostsPage() {
-  const hosts = hostsRoute.useLoaderData() as ControlPlaneHost[]
+  const loaderData = hostsRoute.useLoaderData() as ControlPlaneHost[]
+  const [hosts, setHosts] = useState<ControlPlaneHost[]>(loaderData)
+  const [hostEditors, setHostEditors] = useState<Record<string, ControlPlaneService[]>>(() => buildHostEditors(loaderData))
+  const [hostNotices, setHostNotices] = useState<Record<string, HostNotice | null>>({})
+  const [savingHostId, setSavingHostId] = useState<string | null>(null)
   const [tokens, setTokens] = useState<ControlApiTokenMetadata[]>([])
   const [hostId, setHostId] = useState('')
   const [hostname, setHostname] = useState('')
@@ -317,6 +359,17 @@ function HostsPage() {
   const [issuing, setIssuing] = useState(false)
   const [creatingToken, setCreatingToken] = useState(false)
   const [importing, setImporting] = useState(false)
+
+  const reloadHosts = async () => {
+    const nextHosts = (await trpcClient.hosts.list.query()) as ControlPlaneHost[]
+    setHosts(nextHosts)
+    setHostEditors(buildHostEditors(nextHosts))
+  }
+
+  useEffect(() => {
+    setHosts(loaderData)
+    setHostEditors(buildHostEditors(loaderData))
+  }, [loaderData])
 
   useEffect(() => {
     void trpcClient.tokens.list.query().then((result) => setTokens(result as ControlApiTokenMetadata[])).catch(() => {
@@ -457,11 +510,13 @@ function HostsPage() {
             setImporting(true)
             setError(null)
             try {
-              const parsed = JSON.parse(importJson) as { services?: Array<{ serviceId: string; serviceName: string; localUrl: string; protocol: 'http' | 'websocket'; subdomain: string }> }
+              const parsed = JSON.parse(importJson) as { services?: ControlPlaneService[] }
               await trpcClient.hosts.importStaticConfig.mutate({
                 hostId,
                 services: parsed.services ?? [],
               })
+              await reloadHosts()
+              setError(null)
             } catch {
               setError('导入 static config 失败。')
             } finally {
@@ -482,7 +537,10 @@ function HostsPage() {
         </form>
       </Card>
       <div className="space-y-4">
-        {hosts.map((host) => (
+        {hosts.map((host) => {
+          const editableServices = hostEditors[host.hostId] ?? []
+          const hostNotice = hostNotices[host.hostId] ?? null
+          return (
           <Card key={host.hostId} className="space-y-4">
             <div className="flex items-center justify-between gap-4">
               <div>
@@ -498,6 +556,136 @@ function HostsPage() {
                 <p>desired g{host.desired?.generation ?? '—'}</p>
                 <p>current g{host.current?.generation ?? '—'} · {host.current?.status ?? '—'}</p>
                 <p>applied g{host.applied?.generation ?? '—'}</p>
+              </div>
+            </div>
+            <div className="rounded-md border border-slate-800 p-4 space-y-4">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-medium text-slate-200">Desired services editor</p>
+                  <p className="text-sm text-slate-500">直接编辑并保存 desired.services。</p>
+                </div>
+                <div className="flex gap-2">
+                  <Button
+                    type="button"
+                    className="bg-slate-800 text-slate-100 hover:bg-slate-700"
+                    onClick={() => {
+                      setHostNotices((current) => ({ ...current, [host.hostId]: null }))
+                      setHostEditors((current) => ({
+                        ...current,
+                        [host.hostId]: [...(current[host.hostId] ?? []), createDraftService(host.hostId)],
+                      }))
+                    }}
+                  >
+                    新增 service
+                  </Button>
+                  <Button
+                    type="button"
+                    disabled={savingHostId === host.hostId}
+                    onClick={async () => {
+                      setSavingHostId(host.hostId)
+                      setHostNotices((current) => ({ ...current, [host.hostId]: null }))
+                      try {
+                        await trpcClient.hosts.upsertDesired.mutate({
+                          hostId: host.hostId,
+                          services: editableServices,
+                        })
+                        await reloadHosts()
+                        setHostNotices((current) => ({
+                          ...current,
+                          [host.hostId]: { tone: 'success', text: 'desired services 已保存。' },
+                        }))
+                      } catch {
+                        setHostNotices((current) => ({
+                          ...current,
+                          [host.hostId]: { tone: 'error', text: '保存 desired services 失败。' },
+                        }))
+                      } finally {
+                        setSavingHostId(null)
+                      }
+                    }}
+                  >
+                    {savingHostId === host.hostId ? '保存中...' : '保存 desired'}
+                  </Button>
+                </div>
+              </div>
+              {hostNotice ? (
+                <p className={hostNotice.tone === 'error' ? 'text-sm text-rose-400' : 'text-sm text-emerald-400'}>{hostNotice.text}</p>
+              ) : null}
+              <div className="space-y-3">
+                {editableServices.length > 0 ? editableServices.map((service, index) => (
+                  <div key={`${host.hostId}-${service.serviceId}-${index}`} className="grid gap-3 rounded-md border border-slate-800 p-3 md:grid-cols-2 xl:grid-cols-[1fr_1fr_1.2fr_140px_1fr_auto]">
+                    <Input
+                      placeholder="service id"
+                      value={service.serviceId}
+                      onChange={(event) => {
+                        const value = event.target.value
+                        setHostEditors((current) => ({
+                          ...current,
+                          [host.hostId]: (current[host.hostId] ?? []).map((item, itemIndex) => itemIndex === index ? { ...item, serviceId: value } : item),
+                        }))
+                      }}
+                    />
+                    <Input
+                      placeholder="service name"
+                      value={service.serviceName}
+                      onChange={(event) => {
+                        const value = event.target.value
+                        setHostEditors((current) => ({
+                          ...current,
+                          [host.hostId]: (current[host.hostId] ?? []).map((item, itemIndex) => itemIndex === index ? { ...item, serviceName: value } : item),
+                        }))
+                      }}
+                    />
+                    <Input
+                      placeholder="local url"
+                      value={service.localUrl}
+                      onChange={(event) => {
+                        const value = event.target.value
+                        setHostEditors((current) => ({
+                          ...current,
+                          [host.hostId]: (current[host.hostId] ?? []).map((item, itemIndex) => itemIndex === index ? { ...item, localUrl: value } : item),
+                        }))
+                      }}
+                    />
+                    <select
+                      className="flex h-10 w-full rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-sky-500"
+                      value={service.protocol}
+                      onChange={(event) => {
+                        const value = event.target.value as ServiceProtocol
+                        setHostEditors((current) => ({
+                          ...current,
+                          [host.hostId]: (current[host.hostId] ?? []).map((item, itemIndex) => itemIndex === index ? { ...item, protocol: value } : item),
+                        }))
+                      }}
+                    >
+                      <option value="http">http</option>
+                      <option value="websocket">websocket</option>
+                    </select>
+                    <Input
+                      placeholder="subdomain"
+                      value={service.subdomain}
+                      onChange={(event) => {
+                        const value = event.target.value
+                        setHostEditors((current) => ({
+                          ...current,
+                          [host.hostId]: (current[host.hostId] ?? []).map((item, itemIndex) => itemIndex === index ? { ...item, subdomain: value } : item),
+                        }))
+                      }}
+                    />
+                    <Button
+                      type="button"
+                      className="bg-slate-800 text-slate-100 hover:bg-slate-700"
+                      onClick={() => {
+                        setHostEditors((current) => ({
+                          ...current,
+                          [host.hostId]: (current[host.hostId] ?? []).filter((_, itemIndex) => itemIndex !== index),
+                        }))
+                      }}
+                    >
+                      删除
+                    </Button>
+                  </div>
+                )) : <p className="text-sm text-slate-500">暂无 desired services，可直接新增。</p>}
               </div>
             </div>
             <div className="grid gap-3 md:grid-cols-3">
@@ -518,7 +706,7 @@ function HostsPage() {
               />
             </div>
           </Card>
-        ))}
+        )})}
         {hosts.length === 0 ? (
           <Card>
             <p className="text-sm text-slate-400">还没有 host。现在可以先生成 bootstrap command 再接入新机器。</p>
