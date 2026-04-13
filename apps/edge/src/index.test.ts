@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { createTRPCProxyClient, httpBatchLink } from '@trpc/client'
 import { app } from './app'
 import { handleEdgeFetch } from './worker-entry'
+import { deriveServiceReachability } from './reachability'
 import { buildHostToken } from './lib'
 import type { AppRouter } from './trpc'
 
@@ -22,6 +23,7 @@ class FakeRoutingStub {
   private desired = new Map<string, HostControlState['desired']>()
   private current = new Map<string, HostControlState['current']>()
   private applied = new Map<string, HostControlState['applied']>()
+  private probeResults = new Map<string, Array<{ checkedAt: number; success: boolean; statusCode?: number; latencyMs?: number; failureKind?: string }>>()
 
   private readHostState(hostId: string): HostControlState {
     const applied = this.applied.get(hostId) ?? null
@@ -90,6 +92,33 @@ class FakeRoutingStub {
     if (request.method === 'GET' && url.pathname === '/control/routes') {
       const hostIds = Array.from(new Set([...this.bootstrap.keys(), ...this.desired.keys(), ...this.current.keys(), ...this.applied.keys()])).sort()
       return Response.json(hostIds.flatMap((hostId) => this.readHostState(hostId).projectedRoutes))
+    }
+
+    if (request.method === 'GET' && url.pathname === '/control/services/reachability') {
+      const hostIds = Array.from(new Set([...this.bootstrap.keys(), ...this.desired.keys(), ...this.current.keys(), ...this.applied.keys()])).sort()
+      return Response.json(
+        hostIds.flatMap((hostId) => {
+          const state = this.readHostState(hostId)
+          const services = state.applied?.services ?? state.current?.services ?? state.desired?.services ?? []
+          return services.map((service) => {
+            const recentResults = this.probeResults.get(`${hostId}:${service.serviceId}`) ?? []
+            const lastSuccess = recentResults.find((result) => result.success) ?? null
+            const lastFailure = recentResults.find((result) => !result.success) ?? null
+            return {
+              hostId,
+              serviceId: service.serviceId,
+              serviceName: service.serviceName,
+              subdomain: service.subdomain,
+              protocol: service.protocol,
+              reachability: recentResults[0]?.success ? 'reachable' : recentResults.length > 0 ? 'unreachable' : 'unknown',
+              checkedAt: recentResults[0]?.checkedAt ?? null,
+              lastSuccessAt: lastSuccess?.checkedAt ?? null,
+              lastFailureAt: lastFailure?.checkedAt ?? null,
+              recentResults,
+            }
+          })
+        }),
+      )
     }
 
     if (request.method === 'GET' && url.pathname === '/control/tokens') {
@@ -288,6 +317,22 @@ class FakeRoutingStub {
           appliedAt: Date.now(),
         }
         this.applied.set(hostId, applied)
+        for (const service of body.services) {
+          this.probeResults.set(`${hostId}:${service.serviceId}`, [
+            {
+              checkedAt: Date.now(),
+              success: true,
+              statusCode: 200,
+              latencyMs: 42,
+            },
+            {
+              checkedAt: Date.now() - 60_000,
+              success: false,
+              failureKind: 'timeout',
+              latencyMs: 1500,
+            },
+          ])
+        }
         return Response.json(applied)
       }
     }
@@ -554,6 +599,30 @@ type HostControlState = {
 }
 
 describe('edge app integration', () => {
+  test('derives reachable, degraded, unreachable, and unknown reachability states', () => {
+    expect(deriveServiceReachability([])).toBe('unknown')
+
+    expect(
+      deriveServiceReachability([
+        { hostId: 'host-1', serviceId: 'svc-1', checkedAt: 3, success: false, failureKind: 'timeout' },
+        { hostId: 'host-1', serviceId: 'svc-1', checkedAt: 2, success: true, statusCode: 200 },
+      ]),
+    ).toBe('degraded')
+
+    expect(
+      deriveServiceReachability([
+        { hostId: 'host-1', serviceId: 'svc-1', checkedAt: 3, success: false, failureKind: 'timeout' },
+        { hostId: 'host-1', serviceId: 'svc-1', checkedAt: 2, success: false, failureKind: 'status-code', statusCode: 503 },
+      ]),
+    ).toBe('unreachable')
+
+    expect(
+      deriveServiceReachability([
+        { hostId: 'host-1', serviceId: 'svc-1', checkedAt: 3, success: true, statusCode: 200 },
+        { hostId: 'host-1', serviceId: 'svc-1', checkedAt: 2, success: false, failureKind: 'timeout' },
+      ]),
+    ).toBe('reachable')
+  })
   test('serves control shell asset fallback for browser routes', async () => {
     const env = createEnv()
     const executionCtx = {
@@ -1190,6 +1259,119 @@ describe('edge app integration', () => {
     expect(routes[0]?.serviceId).toBe('svc-phase2-applied')
     expect(routes[0]?.hostId).toBe('host-phase2')
     expect(routes[0]?.generation).toBe(1)
+  })
+
+  test('returns service reachability summaries for applied services', async () => {
+    const env = {
+      ...createEnv(),
+      UI_PASSWORD: 'console-password',
+      SESSION_SECRET: 'session-secret',
+      SESSION_TTL_MS: '3600000',
+    }
+    const operatorHeader = {
+      authorization: 'Bearer dev-operator-token',
+      'content-type': 'application/json',
+    }
+
+    const services = [
+      {
+        serviceId: 'svc-reachability',
+        serviceName: 'reachability',
+        localUrl: 'http://127.0.0.1:3303',
+        protocol: 'http' as const,
+        subdomain: 'reachability.example.test',
+      },
+    ]
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-reachability/desired',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ services }),
+      },
+      env,
+    )
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-reachability/current',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({
+          generation: 1,
+          status: 'acknowledged',
+          services,
+        }),
+      },
+      env,
+    )
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-reachability/applied',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ generation: 1, services }),
+      },
+      env,
+    )
+
+    const restResponse = await app.request(
+      'http://edge.test/api/control/services/reachability',
+      { headers: operatorHeader },
+      env,
+    )
+    const restSummaries = (await restResponse.json()) as Array<{
+      serviceId: string
+      reachability: string
+      recentResults: Array<{ success: boolean; failureKind?: string }>
+      hasProjectedRoute: boolean
+      appliedGeneration: number | null
+    }>
+    expect(restResponse.status).toBe(200)
+    expect(restSummaries[0]?.serviceId).toBe('svc-reachability')
+    expect(restSummaries[0]?.reachability).toBe('reachable')
+    expect(restSummaries[0]?.recentResults).toHaveLength(2)
+    expect(restSummaries[0]?.hasProjectedRoute).toBe(true)
+    expect(restSummaries[0]?.appliedGeneration).toBe(1)
+
+    const executionCtx = { waitUntil() {}, passThroughOnException() {} }
+    let cookieHeader: string | null = null
+
+    const client = createTRPCProxyClient<AppRouter>({
+      links: [
+        httpBatchLink({
+          url: 'http://edge.test/trpc',
+          fetch: async (url, options) => {
+            const headers = new Headers(options?.headers)
+            if (cookieHeader) {
+              headers.set('cookie', cookieHeader)
+            }
+
+            const requestInit: RequestInit = {
+              method: options?.method ?? 'GET',
+              headers,
+            }
+            if (options && 'body' in options) {
+              requestInit.body = options.body ?? null
+            }
+
+            const response = await handleEdgeFetch(new Request(String(url), requestInit), env, executionCtx)
+            const setCookie = response.headers.get('set-cookie')
+            if (setCookie) {
+              cookieHeader = setCookie.split(';')[0] ?? null
+            }
+            return response
+          },
+        }),
+      ],
+    })
+
+    await client.auth.login.mutate({ password: 'console-password' })
+    const trpcSummaries = await client.services.reachability.query()
+    expect(trpcSummaries[0]?.serviceId).toBe('svc-reachability')
+    expect(trpcSummaries[0]?.recentResults).toHaveLength(2)
   })
 
   test('rejects unauthorized host mutations', async () => {

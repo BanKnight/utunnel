@@ -41,6 +41,7 @@ import {
   listAppliedRouteProjections,
   listControlApiTokens,
   listControlPlaneHosts,
+  listServiceReachabilitySummaries,
   promoteAppliedHostConfig,
   reportCurrentHostConfig,
   revokeControlApiToken,
@@ -565,6 +566,14 @@ export const createEdgeApp = () => {
     }
 
     return c.json(await listAppliedRouteProjections(c.env))
+  })
+
+  app.get('/api/control/services/reachability', async (c) => {
+    if (!(await requireOperatorAuthorization(c.req.raw, c.env))) {
+      return unauthorized('invalid_operator_token')
+    }
+
+    return c.json(await listServiceReachabilitySummaries(c.env))
   })
 
   app.post('/api/bootstrap/claim', async (c) => {

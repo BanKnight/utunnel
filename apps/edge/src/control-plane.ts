@@ -6,6 +6,8 @@ import type {
   HostSessionRecord,
   RoutingEntry,
   ServiceDefinition,
+  ServiceProbeResult,
+  ServiceReachability,
 } from '@utunnel/protocol'
 import { configDispatchMessageSchema, serviceDefinitionSchema } from '@utunnel/protocol'
 import { z } from 'zod'
@@ -48,6 +50,29 @@ export type ControlApiTokenMetadata = {
 
 export type ControlApiTokenSecret = ControlApiTokenMetadata & {
   token: string
+}
+
+export type ControlPlaneServiceReachabilitySummary = {
+  hostId: string
+  serviceId: string
+  serviceName: string
+  subdomain: string
+  protocol: ServiceDefinition['protocol']
+  reachability: ServiceReachability
+  checkedAt: number | null
+  lastSuccessAt: number | null
+  lastFailureAt: number | null
+  recentResults: ServiceProbeResult[]
+  hasProjectedRoute: boolean
+  desiredGeneration: number | null
+  currentGeneration: number | null
+  currentStatus: CurrentHostConfig['status'] | null
+  appliedGeneration: number | null
+  runtime: {
+    healthy: boolean
+    lastHeartbeatAt: number | null
+    disconnectedAt: number | null
+  } | null
 }
 
 export type ControlPlaneHost = HostControlState & {
@@ -429,6 +454,62 @@ export const revokeControlApiToken = async (
     toJsonRequest(`https://routing.internal/control/tokens/${encodeURIComponent(tokenId)}/revoke`, {}),
   )
   return readMutationResult<ControlApiTokenMetadata>(response)
+}
+
+export const listServiceReachabilitySummaries = async (
+  env: EdgeBindings,
+): Promise<ControlPlaneServiceReachabilitySummary[]> => {
+  const edgeEnv = parseEdgeEnv(env)
+  const controlStates = await listHostControlStates(env)
+  const stateByHostId = new Map(controlStates.map((state) => [state.hostId, state]))
+  const response = await getControlPlaneStub(env).fetch('https://routing.internal/control/services/reachability')
+  const summaries = await readJson<
+    Array<{
+      hostId: string
+      serviceId: string
+      serviceName: string
+      subdomain: string
+      protocol: ServiceDefinition['protocol']
+      reachability: ServiceReachability
+      checkedAt: number | null
+      lastSuccessAt: number | null
+      lastFailureAt: number | null
+      recentResults: ServiceProbeResult[]
+    }>
+  >(response)
+
+  return Promise.all(
+    summaries.map(async (summary) => {
+      const state = stateByHostId.get(summary.hostId) ?? null
+      const hostSessionResponse = await getHostStub(env, summary.hostId).fetch('https://host.internal/session')
+      const session = (await readJson<HostSessionRecord | null>(hostSessionResponse)) ?? null
+
+      return {
+        ...summary,
+        hasProjectedRoute:
+          state?.projectedRoutes.some((route) => route.serviceId === summary.serviceId && route.hostname === summary.subdomain) ?? false,
+        desiredGeneration: state?.desired?.services.some((service) => service.serviceId === summary.serviceId)
+          ? state.desired?.generation ?? null
+          : null,
+        currentGeneration: state?.current?.services.some((service) => service.serviceId === summary.serviceId)
+          ? state.current?.generation ?? null
+          : null,
+        currentStatus: state?.current?.services.some((service) => service.serviceId === summary.serviceId)
+          ? state.current?.status ?? null
+          : null,
+        appliedGeneration: state?.applied?.services.some((service) => service.serviceId === summary.serviceId)
+          ? state.applied?.generation ?? null
+          : null,
+        runtime: session
+          ? {
+              healthy: isSessionHealthy(session, edgeEnv.HEARTBEAT_GRACE_MS),
+              lastHeartbeatAt: session.lastHeartbeatAt,
+              disconnectedAt: session.disconnectedAt,
+            }
+          : null,
+      } satisfies ControlPlaneServiceReachabilitySummary
+    }),
+  )
 }
 
 export const listControlPlaneHosts = async (env: EdgeBindings): Promise<ControlPlaneHost[]> => {

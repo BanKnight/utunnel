@@ -7,6 +7,8 @@ import {
   heartbeatMessageSchema,
   reconcileAckMessageSchema,
   responseEnvelopeSchema,
+  serviceProbeRecordSchema,
+  serviceReachabilitySummarySchema,
   websocketCloseSchema,
   websocketFrameSchema,
   type AppliedHostConfig,
@@ -16,6 +18,11 @@ import {
   type HttpRequestMessage,
   type HttpResponseMessage,
   type RoutingEntry,
+  type ServiceDefinition,
+  type ServiceProbeFailureKind,
+  type ServiceProbeRecord,
+  type ServiceReachability,
+  type ServiceReachabilitySummary,
   type WebSocketCloseMessage,
   type WebSocketFrameMessage,
   type WebSocketOpenMessage,
@@ -23,6 +30,7 @@ import {
 import { handleEdgeFetch } from './worker-entry'
 import type { EdgeBindings } from './types'
 import { markSessionDisconnected, markSessionHeartbeat, normalizeServiceDefinitions } from './lib'
+import { deriveServiceReachability } from './reachability'
 
 const decoder = new TextDecoder()
 
@@ -63,6 +71,16 @@ type ControlApiTokenRecord = {
 
 type ControlApiTokenMetadata = Omit<ControlApiTokenRecord, 'tokenHash'>
 
+type ProbeExecutionResult = {
+  hostId: string
+  serviceId: string
+  checkedAt: number
+  success: boolean
+  statusCode?: number
+  latencyMs?: number
+  failureKind?: ServiceProbeFailureKind
+}
+
 type HostControlState = {
   hostId: string
   bootstrap: BootstrapState | null
@@ -92,6 +110,10 @@ type ConnectionRole =
   | { type: 'client'; streamId: string }
 
 export class RoutingDirectory extends DurableObject<EdgeBindings> {
+  private static readonly PROBE_INTERVAL_MS = 30_000
+
+  private static readonly PROBE_HISTORY_LIMIT = 5
+
   private bootstrapKey(hostId: string) {
     return `bootstrap:${hostId}`
   }
@@ -114,6 +136,14 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
 
   private apiTokenKey(tokenId: string) {
     return `api-token:${tokenId}`
+  }
+
+  private probeKey(hostId: string, serviceId: string, checkedAt: number) {
+    return `probe:${hostId}:${serviceId}:${checkedAt}`
+  }
+
+  private probePrefix(hostId: string, serviceId: string) {
+    return `probe:${hostId}:${serviceId}:`
   }
 
   private async hashToken(token: string) {
@@ -160,6 +190,145 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
       generation: applied.generation,
       projectedAt: applied.appliedAt,
     }))
+  }
+
+  private collectServices(state: HostControlState) {
+    const serviceById = new Map<string, ServiceDefinition>()
+
+    for (const service of state.desired?.services ?? []) {
+      serviceById.set(service.serviceId, service)
+    }
+    for (const service of state.current?.services ?? []) {
+      if (!serviceById.has(service.serviceId)) {
+        serviceById.set(service.serviceId, service)
+      }
+    }
+    for (const service of state.applied?.services ?? []) {
+      if (!serviceById.has(service.serviceId)) {
+        serviceById.set(service.serviceId, service)
+      }
+    }
+
+    return Array.from(serviceById.values())
+  }
+
+  private async listRecentProbeRecords(hostId: string, serviceId: string): Promise<ServiceProbeRecord[]> {
+    const entries = await this.ctx.storage.list<ServiceProbeRecord>({ prefix: this.probePrefix(hostId, serviceId) })
+    return Array.from(entries.values())
+      .sort((left, right) => right.checkedAt - left.checkedAt)
+      .slice(0, RoutingDirectory.PROBE_HISTORY_LIMIT)
+  }
+
+  private async buildServiceReachabilitySummary(
+    hostId: string,
+    service: ServiceDefinition,
+  ): Promise<ServiceReachabilitySummary> {
+    const recentResults = await this.listRecentProbeRecords(hostId, service.serviceId)
+    const lastSuccess = recentResults.find((result) => result.success) ?? null
+    const lastFailure = recentResults.find((result) => !result.success) ?? null
+
+    return serviceReachabilitySummarySchema.parse({
+      hostId,
+      serviceId: service.serviceId,
+      serviceName: service.serviceName,
+      subdomain: service.subdomain,
+      protocol: service.protocol,
+      reachability: deriveServiceReachability(recentResults),
+      checkedAt: recentResults[0]?.checkedAt ?? null,
+      lastSuccessAt: lastSuccess?.checkedAt ?? null,
+      lastFailureAt: lastFailure?.checkedAt ?? null,
+      recentResults: recentResults.map((result) => ({
+        checkedAt: result.checkedAt,
+        success: result.success,
+        statusCode: result.statusCode,
+        latencyMs: result.latencyMs,
+        failureKind: result.failureKind,
+      })),
+    })
+  }
+
+  private async listServiceReachabilitySummaries(): Promise<ServiceReachabilitySummary[]> {
+    const states = await this.listHostControlStates()
+    const summaries = await Promise.all(
+      states.flatMap((state) =>
+        this.collectServices(state).map((service) => this.buildServiceReachabilitySummary(state.hostId, service)),
+      ),
+    )
+
+    return summaries.sort((left, right) => {
+      if (left.hostId !== right.hostId) {
+        return left.hostId.localeCompare(right.hostId)
+      }
+      return left.serviceId.localeCompare(right.serviceId)
+    })
+  }
+
+  private async recordProbeResult(result: ProbeExecutionResult) {
+    const record = serviceProbeRecordSchema.parse(result)
+    await this.ctx.storage.put(this.probeKey(result.hostId, result.serviceId, result.checkedAt), record)
+  }
+
+  private async executeServiceProbe(hostId: string, service: ServiceDefinition): Promise<ProbeExecutionResult> {
+    const startedAt = Date.now()
+    try {
+      const response = await fetch(`https://${service.subdomain}/`, {
+        method: 'GET',
+        headers: {
+          'user-agent': 'utunnel-reachability-probe/1.0',
+          'x-utunnel-probe': '1',
+        },
+      })
+
+      const checkedAt = Date.now()
+      const latencyMs = checkedAt - startedAt
+      const success = response.status < 500
+      return success
+        ? {
+            hostId,
+            serviceId: service.serviceId,
+            checkedAt,
+            success: true,
+            statusCode: response.status,
+            latencyMs,
+          }
+        : {
+            hostId,
+            serviceId: service.serviceId,
+            checkedAt,
+            success: false,
+            statusCode: response.status,
+            latencyMs,
+            failureKind: 'status-code',
+          }
+    } catch {
+      const checkedAt = Date.now()
+      return {
+        hostId,
+        serviceId: service.serviceId,
+        checkedAt,
+        success: false,
+        latencyMs: checkedAt - startedAt,
+        failureKind: 'unknown',
+      }
+    }
+  }
+
+  private async runReachabilityProbePass() {
+    const states = await this.listHostControlStates()
+    for (const state of states) {
+      for (const service of state.applied?.services ?? []) {
+        if (service.protocol !== 'http') {
+          continue
+        }
+
+        const result = await this.executeServiceProbe(state.hostId, service)
+        await this.recordProbeResult(result)
+      }
+    }
+  }
+
+  private scheduleNextProbeRun(delayMs = RoutingDirectory.PROBE_INTERVAL_MS) {
+    this.ctx.storage.setAlarm(Date.now() + delayMs)
   }
 
   private async readHostControlState(hostId: string): Promise<HostControlState> {
@@ -271,6 +440,16 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
 
     if (request.method === 'GET' && url.pathname === '/control/routes') {
       return Response.json(await this.listAppliedRouteProjections())
+    }
+
+    if (request.method === 'GET' && url.pathname === '/control/services/reachability') {
+      return Response.json(await this.listServiceReachabilitySummaries())
+    }
+
+    if (request.method === 'POST' && url.pathname === '/control/probes/run') {
+      await this.runReachabilityProbePass()
+      this.scheduleNextProbeRun()
+      return Response.json({ ok: true })
     }
 
     if (request.method === 'GET' && url.pathname === '/control/tokens') {
@@ -500,6 +679,7 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
             updatedAt: Date.now(),
           })
           await this.ctx.storage.put(this.desiredKey(hostId), desired)
+          this.scheduleNextProbeRun()
           return Response.json(desired)
         } catch (error) {
           return Response.json(
@@ -576,6 +756,7 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
           }
 
           await this.ctx.storage.put(this.appliedKey(hostId), applied)
+          this.scheduleNextProbeRun()
           return Response.json(applied)
         } catch (error) {
           return Response.json(
@@ -587,6 +768,11 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
     }
 
     return Response.json({ error: 'not_found' }, { status: 404 })
+  }
+
+  async alarm() {
+    await this.runReachabilityProbePass()
+    this.scheduleNextProbeRun()
   }
 }
 

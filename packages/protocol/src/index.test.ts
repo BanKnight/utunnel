@@ -9,6 +9,8 @@ import {
   desiredHostConfigSchema,
   hostSessionRecordSchema,
   serviceDefinitionSchema,
+  serviceProbeRecordSchema,
+  serviceReachabilitySummarySchema,
   tunnelMessageSchema,
 } from './index'
 
@@ -128,6 +130,75 @@ describe('protocol schemas', () => {
 
     expect(bootstrap.type).toBe('bootstrap_claim')
     expect(dispatch.type).toBe('config_dispatch')
+  })
+
+  test('validates service probe records and reachability summaries', () => {
+    const probeRecord = serviceProbeRecordSchema.parse({
+      hostId: 'host-1',
+      serviceId: 'svc-1',
+      checkedAt: Date.now(),
+      success: false,
+      failureKind: 'timeout',
+      latencyMs: 1200,
+    })
+
+    const summary = serviceReachabilitySummarySchema.parse({
+      hostId: 'host-1',
+      serviceId: 'svc-1',
+      serviceName: 'echo',
+      subdomain: 'echo.example.test',
+      protocol: 'http',
+      reachability: 'degraded',
+      checkedAt: Date.now(),
+      lastSuccessAt: Date.now() - 60_000,
+      lastFailureAt: Date.now(),
+      recentResults: [
+        {
+          checkedAt: Date.now() - 60_000,
+          success: true,
+          statusCode: 200,
+          latencyMs: 44,
+        },
+        {
+          checkedAt: Date.now(),
+          success: false,
+          failureKind: 'timeout',
+          latencyMs: 1200,
+        },
+      ],
+    })
+
+    expect(probeRecord.failureKind).toBe('timeout')
+    expect(summary.reachability).toBe('degraded')
+    expect(summary.recentResults).toHaveLength(2)
+  })
+
+  test('rejects unsuccessful service probe records without failure kind', () => {
+    expect(() =>
+      serviceProbeRecordSchema.parse({
+        hostId: 'host-1',
+        serviceId: 'svc-1',
+        checkedAt: Date.now(),
+        success: false,
+      }),
+    ).toThrow()
+  })
+
+  test('rejects invalid service reachability summary payloads', () => {
+    expect(() =>
+      serviceReachabilitySummarySchema.parse({
+        hostId: 'host-1',
+        serviceId: 'svc-1',
+        serviceName: 'echo',
+        subdomain: 'echo.example.test',
+        protocol: 'http',
+        reachability: 'broken',
+        checkedAt: Date.now(),
+        lastSuccessAt: null,
+        lastFailureAt: null,
+        recentResults: [],
+      }),
+    ).toThrow()
   })
 
   test('rejects control-plane dispatch messages from tunnelMessageSchema', () => {

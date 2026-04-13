@@ -58,6 +58,55 @@ export const appliedHostConfigSchema = z.object({
   services: z.array(serviceDefinitionSchema),
 })
 
+export const serviceProbeFailureKindSchema = z.enum([
+  'timeout',
+  'dns',
+  'edge',
+  'upstream',
+  'status-code',
+  'unknown',
+])
+
+export const serviceReachabilitySchema = z.enum(['reachable', 'degraded', 'unreachable', 'unknown'])
+
+export const serviceProbeResultSchema = z.object({
+  checkedAt: z.number().int().nonnegative(),
+  success: z.boolean(),
+  statusCode: z.number().int().min(100).max(599).optional(),
+  latencyMs: z.number().int().nonnegative().optional(),
+  failureKind: serviceProbeFailureKindSchema.optional(),
+})
+.refine((value) => value.success || Boolean(value.failureKind), {
+  message: 'failure_kind_required_when_unsuccessful',
+  path: ['failureKind'],
+})
+
+export const serviceProbeRecordSchema = z.object({
+  hostId: z.string().min(1),
+  serviceId: z.string().min(1),
+  checkedAt: z.number().int().nonnegative(),
+  success: z.boolean(),
+  statusCode: z.number().int().min(100).max(599).optional(),
+  latencyMs: z.number().int().nonnegative().optional(),
+  failureKind: serviceProbeFailureKindSchema.optional(),
+}).refine((value) => value.success || Boolean(value.failureKind), {
+  message: 'failure_kind_required_when_unsuccessful',
+  path: ['failureKind'],
+})
+
+export const serviceReachabilitySummarySchema = z.object({
+  hostId: z.string().min(1),
+  serviceId: z.string().min(1),
+  serviceName: z.string().min(1),
+  subdomain: z.string().min(1),
+  protocol: serviceProtocolSchema,
+  reachability: serviceReachabilitySchema,
+  checkedAt: z.number().int().nonnegative().nullable(),
+  lastSuccessAt: z.number().int().nonnegative().nullable(),
+  lastFailureAt: z.number().int().nonnegative().nullable(),
+  recentResults: z.array(serviceProbeResultSchema),
+})
+
 export const bootstrapClaimMessageSchema = z.object({
   type: z.literal('bootstrap_claim'),
   payload: hostIdentitySchema.extend({
@@ -213,6 +262,11 @@ export type HostSessionRecord = z.infer<typeof hostSessionRecordSchema>
 export type DesiredHostConfig = z.infer<typeof desiredHostConfigSchema>
 export type CurrentHostConfig = z.infer<typeof currentHostConfigSchema>
 export type AppliedHostConfig = z.infer<typeof appliedHostConfigSchema>
+export type ServiceProbeFailureKind = z.infer<typeof serviceProbeFailureKindSchema>
+export type ServiceReachability = z.infer<typeof serviceReachabilitySchema>
+export type ServiceProbeResult = z.infer<typeof serviceProbeResultSchema>
+export type ServiceProbeRecord = z.infer<typeof serviceProbeRecordSchema>
+export type ServiceReachabilitySummary = z.infer<typeof serviceReachabilitySummarySchema>
 export type ConfigDispatchStatus = z.infer<typeof configDispatchStatusSchema>
 export type HttpRequestMessage = z.infer<typeof requestEnvelopeSchema>
 export type HttpResponseMessage = z.infer<typeof responseEnvelopeSchema>

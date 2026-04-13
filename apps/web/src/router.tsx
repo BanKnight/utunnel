@@ -97,6 +97,35 @@ type ControlPlaneHost = {
   } | null
 }
 
+type ControlPlaneServiceReachabilitySummary = {
+  hostId: string
+  serviceId: string
+  serviceName: string
+  subdomain: string
+  protocol: ServiceProtocol
+  reachability: 'reachable' | 'degraded' | 'unreachable' | 'unknown'
+  checkedAt: number | null
+  lastSuccessAt: number | null
+  lastFailureAt: number | null
+  recentResults: Array<{
+    checkedAt: number
+    success: boolean
+    statusCode?: number
+    latencyMs?: number
+    failureKind?: 'timeout' | 'dns' | 'edge' | 'upstream' | 'status-code' | 'unknown'
+  }>
+  hasProjectedRoute: boolean
+  desiredGeneration: number | null
+  currentGeneration: number | null
+  currentStatus: 'pending' | 'acknowledged' | 'error' | null
+  appliedGeneration: number | null
+  runtime: {
+    healthy: boolean
+    lastHeartbeatAt: number | null
+    disconnectedAt: number | null
+  } | null
+}
+
 type HostNotice = {
   tone: 'error' | 'success'
   text: string
@@ -470,6 +499,7 @@ function HostsPage() {
   const [error, setError] = useState<string | null>(null)
   const [issuing, setIssuing] = useState(false)
   const [creatingToken, setCreatingToken] = useState(false)
+  const [reachabilitySummaries, setReachabilitySummaries] = useState<ControlPlaneServiceReachabilitySummary[]>([])
   const [importingHostId, setImportingHostId] = useState<string | null>(null)
 
   const reloadHosts = async () => {
@@ -487,7 +517,14 @@ function HostsPage() {
     void trpcClient.tokens.list.query().then((result) => setTokens(result as ControlApiTokenMetadata[])).catch(() => {
       setTokens([])
     })
+
+    void trpcClient.services.reachability.query().then((result) => {
+      setReachabilitySummaries(result as ControlPlaneServiceReachabilitySummary[])
+    }).catch(() => {
+      setReachabilitySummaries([])
+    })
   }, [])
+
 
   return (
     <div className="space-y-6">
@@ -619,6 +656,7 @@ function HostsPage() {
           const isDirty = !areServicesEqual(editableServices, savedServices)
           const hostNotice = hostNotices[host.hostId] ?? null
           const importDraft = importDrafts[host.hostId] ?? ''
+          const serviceSummaries = reachabilitySummaries.filter((summary) => summary.hostId === host.hostId)
           return (
           <Card key={host.hostId} className="space-y-4">
             <div className="flex items-center justify-between gap-4">
@@ -636,6 +674,46 @@ function HostsPage() {
                 <p>current g{host.current?.generation ?? '—'} · {host.current?.status ?? '—'}</p>
                 <p>applied g{host.applied?.generation ?? '—'}</p>
               </div>
+            </div>
+            <div className="rounded-md border border-slate-800 p-4 space-y-3">
+              <div>
+                <p className="text-sm font-medium text-slate-200">Service reachability</p>
+                <p className="text-sm text-slate-500">从 utunnel 公网入口视角展示最近一次 probe 与最近几次结果。</p>
+              </div>
+              {serviceSummaries.length > 0 ? (
+                <div className="space-y-3">
+                  {serviceSummaries.map((summary) => (
+                    <div key={`${summary.hostId}-${summary.serviceId}`} className="rounded-md border border-slate-800 px-4 py-3">
+                      <div className="flex items-start justify-between gap-4">
+                        <div>
+                          <p className="font-medium text-slate-100">{summary.serviceName} · {summary.subdomain}</p>
+                          <p className="text-sm text-slate-400">{summary.serviceId} · {summary.protocol} · {summary.hasProjectedRoute ? 'projected' : 'not projected'}</p>
+                        </div>
+                        <div className="text-right">
+                          <p className={summary.reachability === 'reachable' ? 'text-sm text-emerald-400' : summary.reachability === 'degraded' ? 'text-sm text-amber-400' : summary.reachability === 'unreachable' ? 'text-sm text-rose-400' : 'text-sm text-slate-400'}>
+                            {summary.reachability}
+                          </p>
+                          <p className="text-xs text-slate-500">checked: {summary.checkedAt ? new Date(summary.checkedAt).toLocaleTimeString() : '—'}</p>
+                        </div>
+                      </div>
+                      <div className="mt-3 flex flex-wrap gap-2 text-xs">
+                        {summary.recentResults.length > 0 ? summary.recentResults.map((result) => (
+                          <span key={`${summary.serviceId}-${result.checkedAt}`} className={result.success ? 'rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-1 text-emerald-300' : 'rounded-full border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-rose-300'}>
+                            {result.success ? 'ok' : result.failureKind ?? 'fail'} · {new Date(result.checkedAt).toLocaleTimeString()}
+                          </span>
+                        )) : <span className="text-slate-500">尚无 probe 结果</span>}
+                      </div>
+                      <div className="mt-3 grid gap-2 text-xs text-slate-500 md:grid-cols-3">
+                        <p>desired g{summary.desiredGeneration ?? '—'}</p>
+                        <p>current g{summary.currentGeneration ?? '—'} · {summary.currentStatus ?? '—'}</p>
+                        <p>applied g{summary.appliedGeneration ?? '—'}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-sm text-slate-500">当前 host 还没有 service reachability 摘要。</p>
+              )}
             </div>
             <div className="rounded-md border border-slate-800 p-4 space-y-4">
               <div className="flex items-center justify-between gap-3">

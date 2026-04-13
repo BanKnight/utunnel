@@ -12,6 +12,7 @@ import {
   createControlApiToken,
   listControlApiTokens,
   listControlPlaneHosts,
+  listServiceReachabilitySummaries,
   issueHostBootstrap,
   revokeControlApiToken,
   rotateControlApiToken,
@@ -125,6 +126,11 @@ export const appRouter = t.router({
         }
         return result.value
       }),
+  }),
+  services: t.router({
+    reachability: protectedProcedure.query(async ({ ctx }) => {
+      return listServiceReachabilitySummaries(ctx.env)
+    }),
   }),
   tokens: t.router({
     list: protectedProcedure.query(async ({ ctx }) => {
