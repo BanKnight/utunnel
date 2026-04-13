@@ -22,7 +22,7 @@ export const serviceDefinitionSchema = z.object({
 export const serviceBindingPayloadSchema = z.object({
   sessionId: z.string().min(1),
   version: z.number().int().positive(),
-  services: z.array(serviceDefinitionSchema).min(1),
+  services: z.array(serviceDefinitionSchema),
 })
 
 export const hostSessionRecordSchema = z.object({
@@ -115,7 +115,7 @@ export const registerServicesMessageSchema = z.object({
     hostId: z.string().min(1),
     sessionId: z.string().min(1),
     version: z.number().int().positive(),
-    services: z.array(serviceDefinitionSchema).min(1),
+    services: z.array(serviceDefinitionSchema),
   }),
 })
 
@@ -184,7 +184,7 @@ export const rebindServicesMessageSchema = z.object({
     previousSessionId: z.string().min(1).optional(),
     nextSessionId: z.string().min(1),
     version: z.number().int().positive(),
-    services: z.array(serviceDefinitionSchema).min(1),
+    services: z.array(serviceDefinitionSchema),
   }),
 })
 

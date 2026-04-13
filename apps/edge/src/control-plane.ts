@@ -18,8 +18,16 @@ export type AppliedRouteProjection = {
   projectedAt: number
 }
 
+export type BootstrapHostState = {
+  hostname: string
+  issuedAt: number
+  expiresAt: number
+  claimedAt: number | null
+}
+
 export type HostControlState = {
   hostId: string
+  bootstrap: BootstrapHostState | null
   desired: DesiredHostConfig | null
   current: CurrentHostConfig | null
   applied: AppliedHostConfig | null
@@ -60,6 +68,39 @@ type AppliedMutationInput = {
   services: ServiceDefinition[]
 }
 
+type BootstrapIssueResponse = {
+  hostId: string
+  hostname: string
+  bootstrapToken: string
+  issuedAt: number
+  expiresAt: number
+  claimedAt: number | null
+}
+
+export type BootstrapIssueResult = BootstrapIssueResponse & {
+  command: string
+}
+
+type BootstrapIssueInput = {
+  hostId: string
+  hostname: string
+  edgeBaseUrl: string
+  expiresInMs?: number
+}
+
+type BootstrapClaimInput = {
+  hostId: string
+  hostname: string
+  bootstrapToken: string
+}
+
+type BootstrapClaimResult = {
+  ok: true
+  hostId: string
+  token: string
+  claimedAt: number
+}
+
 const toJsonRequest = (url: string, body: unknown, method = 'POST') => {
   return new Request(url, {
     method,
@@ -96,6 +137,28 @@ const readMutationResult = async <T>(response: Response): Promise<ControlPlaneMu
   }
 }
 
+const buildBootstrapCommand = (input: {
+  hostId: string
+  hostname: string
+  bootstrapToken: string
+  edgeBaseUrl: string
+}) => {
+  const config = {
+    hostId: input.hostId,
+    hostname: input.hostname,
+    bootstrapToken: input.bootstrapToken,
+    edgeBaseUrl: input.edgeBaseUrl,
+    services: [],
+  }
+
+  return [
+    "cat > agent.config.json <<'EOF'",
+    JSON.stringify(config, null, 2),
+    'EOF',
+    'UTUNNEL_AGENT_CONFIG=agent.config.json bun --cwd apps/agent run dev',
+  ].join('\n')
+}
+
 export const buildAppliedRouteProjections = (applied: AppliedHostConfig | null): AppliedRouteProjection[] => {
   if (!applied) {
     return []
@@ -108,6 +171,20 @@ export const buildAppliedRouteProjections = (applied: AppliedHostConfig | null):
     generation: applied.generation,
     projectedAt: applied.appliedAt,
   }))
+}
+
+export const getHostControlState = async (env: EdgeBindings, hostId: string): Promise<HostControlState | null> => {
+  const response = await getControlPlaneStub(env).fetch(`https://routing.internal/control/hosts/${encodeURIComponent(hostId)}`)
+  if (response.status === 404) {
+    return null
+  }
+
+  return readJson<HostControlState>(response)
+}
+
+export const getDesiredHostConfig = async (env: EdgeBindings, hostId: string): Promise<DesiredHostConfig | null> => {
+  const state = await getHostControlState(env, hostId)
+  return state?.desired ?? null
 }
 
 export const listHostControlStates = async (env: EdgeBindings): Promise<HostControlState[]> => {
@@ -179,6 +256,67 @@ export const deleteHostControlState = async (
   return readMutationResult<{ ok: true }>(response)
 }
 
+export const issueHostBootstrap = async (
+  env: EdgeBindings,
+  input: BootstrapIssueInput,
+): Promise<ControlPlaneMutationResult<BootstrapIssueResult>> => {
+  const response = await getControlPlaneStub(env).fetch(
+    toJsonRequest(`https://routing.internal/control/hosts/${encodeURIComponent(input.hostId)}/bootstrap`, {
+      hostname: input.hostname,
+      expiresInMs: input.expiresInMs,
+    }),
+  )
+
+  const result = await readMutationResult<BootstrapIssueResponse>(response)
+  if (!result.ok) {
+    return result
+  }
+
+  return {
+    ok: true,
+    value: {
+      ...result.value,
+      command: buildBootstrapCommand({
+        hostId: result.value.hostId,
+        hostname: result.value.hostname,
+        bootstrapToken: result.value.bootstrapToken,
+        edgeBaseUrl: input.edgeBaseUrl,
+      }),
+    },
+  }
+}
+
+export const claimHostBootstrap = async (
+  env: EdgeBindings,
+  input: BootstrapClaimInput,
+): Promise<ControlPlaneMutationResult<BootstrapClaimResult>> => {
+  const response = await getControlPlaneStub(env).fetch(
+    toJsonRequest(`https://routing.internal/control/hosts/${encodeURIComponent(input.hostId)}/claim`, {
+      hostname: input.hostname,
+      bootstrapToken: input.bootstrapToken,
+    }),
+  )
+
+  return readMutationResult<BootstrapClaimResult>(response)
+}
+
+export const verifyHostAccessToken = async (env: EdgeBindings, hostId: string, token: string | null): Promise<boolean> => {
+  if (!token) {
+    return false
+  }
+
+  const response = await getControlPlaneStub(env).fetch(
+    toJsonRequest(`https://routing.internal/control/hosts/${encodeURIComponent(hostId)}/token/verify`, { token }),
+  )
+
+  if (!response.ok) {
+    return false
+  }
+
+  const json = (await response.json()) as { ok: boolean }
+  return json.ok
+}
+
 export const listControlPlaneHosts = async (env: EdgeBindings): Promise<ControlPlaneHost[]> => {
   const edgeEnv = parseEdgeEnv(env)
   const controlStates = await listHostControlStates(env)
@@ -194,6 +332,7 @@ export const listControlPlaneHosts = async (env: EdgeBindings): Promise<ControlP
     hostIds.map(async (hostId) => {
       const baseState = controlStateByHostId.get(hostId) ?? {
         hostId,
+        bootstrap: null,
         desired: null,
         current: null,
         applied: null,

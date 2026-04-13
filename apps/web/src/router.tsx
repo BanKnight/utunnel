@@ -30,8 +30,24 @@ type DashboardSummary = {
   }>
 }
 
+type BootstrapIssueResult = {
+  hostId: string
+  hostname: string
+  bootstrapToken: string
+  issuedAt: number
+  expiresAt: number
+  claimedAt: number | null
+  command: string
+}
+
 type ControlPlaneHost = {
   hostId: string
+  bootstrap: {
+    hostname: string
+    issuedAt: number
+    expiresAt: number
+    claimedAt: number | null
+  } | null
   desired: {
     generation: number
     services: Array<{ serviceId: string; serviceName: string; subdomain: string }>
@@ -277,13 +293,57 @@ function DashboardPage() {
 
 function HostsPage() {
   const hosts = hostsRoute.useLoaderData() as ControlPlaneHost[]
+  const [hostId, setHostId] = useState('')
+  const [hostname, setHostname] = useState('')
+  const [command, setCommand] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [issuing, setIssuing] = useState(false)
 
   return (
     <div className="space-y-6">
       <div>
         <h2 className="text-2xl font-semibold text-slate-50">Hosts</h2>
-        <p className="text-sm text-slate-400">Phase 2 开始展示 desired/current/applied 与 runtime 的最小差异。</p>
+        <p className="text-sm text-slate-400">Phase 4 增加最小 bootstrap onboarding command 生成。</p>
       </div>
+      <Card className="space-y-4">
+        <div>
+          <h3 className="text-lg font-medium text-slate-50">新增 Host</h3>
+          <p className="text-sm text-slate-400">先签发一次性 onboarding command，agent claim 后再进入常规 host session。</p>
+        </div>
+        <form
+          className="grid gap-3 md:grid-cols-[1fr_1fr_auto]"
+          onSubmit={async (event) => {
+            event.preventDefault()
+            setIssuing(true)
+            setError(null)
+            try {
+              const result = (await trpcClient.hosts.issueBootstrap.mutate({
+                hostId,
+                hostname,
+                edgeBaseUrl: window.location.origin,
+              })) as BootstrapIssueResult
+              setCommand(result.command)
+            } catch {
+              setError('生成 onboarding command 失败。')
+            } finally {
+              setIssuing(false)
+            }
+          }}
+        >
+          <Input placeholder="host id" value={hostId} onChange={(event) => setHostId(event.target.value)} />
+          <Input placeholder="hostname" value={hostname} onChange={(event) => setHostname(event.target.value)} />
+          <Button type="submit" disabled={issuing || hostId.length === 0 || hostname.length === 0}>
+            {issuing ? '生成中...' : '生成命令'}
+          </Button>
+        </form>
+        {error ? <p className="text-sm text-rose-400">{error}</p> : null}
+        {command ? (
+          <div className="rounded-md border border-slate-800 bg-slate-950 p-4">
+            <p className="mb-2 text-sm text-slate-400">Onboarding command</p>
+            <pre className="overflow-x-auto whitespace-pre-wrap text-xs text-slate-200">{command}</pre>
+          </div>
+        ) : null}
+      </Card>
       <div className="space-y-4">
         {hosts.map((host) => (
           <Card key={host.hostId} className="space-y-4">
@@ -292,6 +352,9 @@ function HostsPage() {
                 <h3 className="text-lg font-medium text-slate-50">{host.hostId}</h3>
                 <p className="text-sm text-slate-400">
                   runtime: {host.runtime ? `${host.runtime.healthy ? 'healthy' : 'unhealthy'} / v${host.runtime.version}` : 'offline'}
+                </p>
+                <p className="text-sm text-slate-500">
+                  bootstrap: {host.bootstrap ? `${host.bootstrap.hostname} · ${host.bootstrap.claimedAt ? 'claimed' : 'pending'}` : '—'}
                 </p>
               </div>
               <div className="text-right text-sm text-slate-400">
@@ -321,13 +384,14 @@ function HostsPage() {
         ))}
         {hosts.length === 0 ? (
           <Card>
-            <p className="text-sm text-slate-400">还没有 host。Phase 2 现在已经有服务端 registry 了，但还没接入创建表单。</p>
+            <p className="text-sm text-slate-400">还没有 host。现在可以先生成 bootstrap command 再接入新机器。</p>
           </Card>
         ) : null}
       </div>
     </div>
   )
 }
+
 
 function StateColumn({ title, items, empty }: { title: string; items: string[]; empty: string }) {
   return (

@@ -1,9 +1,11 @@
 import { DurableObject } from 'cloudflare:workers'
 import {
   appliedHostConfigSchema,
+  configDispatchMessageSchema,
   currentHostConfigSchema,
   desiredHostConfigSchema,
   heartbeatMessageSchema,
+  reconcileAckMessageSchema,
   responseEnvelopeSchema,
   websocketCloseSchema,
   websocketFrameSchema,
@@ -32,13 +34,33 @@ type AppliedRouteProjection = {
   projectedAt: number
 }
 
+type BootstrapRecord = {
+  hostId: string
+  hostname: string
+  bootstrapToken: string
+  issuedAt: number
+  expiresAt: number
+  claimedAt: number | null
+}
+
+type BootstrapState = Omit<BootstrapRecord, 'bootstrapToken'>
+
+type HostAccessTokenRecord = {
+  token: string
+  issuedAt: number
+}
+
 type HostControlState = {
   hostId: string
+  bootstrap: BootstrapState | null
   desired: DesiredHostConfig | null
   current: CurrentHostConfig | null
   applied: AppliedHostConfig | null
   projectedRoutes: AppliedRouteProjection[]
 }
+
+type ConfigDispatchMessage = ReturnType<typeof configDispatchMessageSchema.parse>
+type ReconcileAckMessage = ReturnType<typeof reconcileAckMessageSchema.parse>
 
 type RelayHttpRequest = {
   expectedSessionId: string
@@ -57,6 +79,10 @@ type ConnectionRole =
   | { type: 'client'; streamId: string }
 
 export class RoutingDirectory extends DurableObject<EdgeBindings> {
+  private bootstrapKey(hostId: string) {
+    return `bootstrap:${hostId}`
+  }
+
   private desiredKey(hostId: string) {
     return `desired:${hostId}`
   }
@@ -67,6 +93,10 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
 
   private appliedKey(hostId: string) {
     return `applied:${hostId}`
+  }
+
+  private hostTokenKey(hostId: string) {
+    return `host-token:${hostId}`
   }
 
   private buildProjectedRoutes(applied: AppliedHostConfig | null): AppliedRouteProjection[] {
@@ -84,7 +114,8 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
   }
 
   private async readHostControlState(hostId: string): Promise<HostControlState> {
-    const [desired, current, applied] = await Promise.all([
+    const [bootstrap, desired, current, applied] = await Promise.all([
+      this.ctx.storage.get<BootstrapRecord>(this.bootstrapKey(hostId)),
       this.ctx.storage.get<DesiredHostConfig>(this.desiredKey(hostId)),
       this.ctx.storage.get<CurrentHostConfig>(this.currentKey(hostId)),
       this.ctx.storage.get<AppliedHostConfig>(this.appliedKey(hostId)),
@@ -92,6 +123,15 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
 
     return {
       hostId,
+      bootstrap: bootstrap
+        ? {
+            hostId: bootstrap.hostId,
+            hostname: bootstrap.hostname,
+            issuedAt: bootstrap.issuedAt,
+            expiresAt: bootstrap.expiresAt,
+            claimedAt: bootstrap.claimedAt,
+          }
+        : null,
       desired: desired ?? null,
       current: current ?? null,
       applied: applied ?? null,
@@ -100,13 +140,17 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
   }
 
   private async listHostControlStates(): Promise<HostControlState[]> {
-    const [desiredEntries, currentEntries, appliedEntries] = await Promise.all([
+    const [bootstrapEntries, desiredEntries, currentEntries, appliedEntries] = await Promise.all([
+      this.ctx.storage.list<BootstrapRecord>({ prefix: 'bootstrap:' }),
       this.ctx.storage.list<DesiredHostConfig>({ prefix: 'desired:' }),
       this.ctx.storage.list<CurrentHostConfig>({ prefix: 'current:' }),
       this.ctx.storage.list<AppliedHostConfig>({ prefix: 'applied:' }),
     ])
 
     const hostIds = new Set<string>()
+    for (const key of bootstrapEntries.keys()) {
+      hostIds.add(key.replace(/^bootstrap:/, ''))
+    }
     for (const key of desiredEntries.keys()) {
       hostIds.add(key.replace(/^desired:/, ''))
     }
@@ -117,7 +161,11 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
       hostIds.add(key.replace(/^applied:/, ''))
     }
 
-    return Promise.all(Array.from(hostIds).sort((left, right) => left.localeCompare(right)).map((hostId) => this.readHostControlState(hostId)))
+    return Promise.all(
+      Array.from(hostIds)
+        .sort((left, right) => left.localeCompare(right))
+        .map((hostId) => this.readHostControlState(hostId)),
+    )
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -167,9 +215,96 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
       return Response.json(await this.listHostControlStates())
     }
 
-    if (request.method === 'GET' && url.pathname === '/control/routes') {
-      const states = await this.listHostControlStates()
-      return Response.json(states.flatMap((state) => state.projectedRoutes))
+    const bootstrapMatch = url.pathname.match(/^\/control\/hosts\/([^/]+?)\/bootstrap$/)
+    if (bootstrapMatch) {
+      const hostId = decodeURIComponent(bootstrapMatch[1] ?? '')
+      if (!hostId) {
+        return Response.json({ ok: false, reason: 'host_id_required' }, { status: 400 })
+      }
+
+      if (request.method === 'POST') {
+        const existingHostToken = await this.ctx.storage.get<HostAccessTokenRecord>(this.hostTokenKey(hostId))
+        if (existingHostToken) {
+          return Response.json({ ok: false, reason: 'host_already_claimed' }, { status: 409 })
+        }
+
+        const body = (await request.json().catch(() => null)) as { hostname?: string; expiresInMs?: number } | null
+        const hostname = body?.hostname?.trim()
+        if (!hostname) {
+          return Response.json({ ok: false, reason: 'hostname_required' }, { status: 400 })
+        }
+
+        const expiresInMs = body?.expiresInMs ?? 10 * 60 * 1000
+        if (!Number.isInteger(expiresInMs) || expiresInMs <= 0) {
+          return Response.json({ ok: false, reason: 'invalid_bootstrap_expiry' }, { status: 400 })
+        }
+
+        const issuedAt = Date.now()
+        const bootstrap = {
+          hostId,
+          hostname,
+          bootstrapToken: crypto.randomUUID(),
+          issuedAt,
+          expiresAt: issuedAt + expiresInMs,
+          claimedAt: null,
+        } satisfies BootstrapRecord
+        await this.ctx.storage.put(this.bootstrapKey(hostId), bootstrap)
+        return Response.json(bootstrap)
+      }
+    }
+
+    const claimMatch = url.pathname.match(/^\/control\/hosts\/([^/]+?)\/claim$/)
+    if (claimMatch) {
+      const hostId = decodeURIComponent(claimMatch[1] ?? '')
+      if (!hostId) {
+        return Response.json({ ok: false, reason: 'host_id_required' }, { status: 400 })
+      }
+
+      if (request.method === 'POST') {
+        const body = (await request.json().catch(() => null)) as { hostname?: string; bootstrapToken?: string } | null
+        const bootstrap = await this.ctx.storage.get<BootstrapRecord>(this.bootstrapKey(hostId))
+        if (!bootstrap) {
+          return Response.json({ ok: false, reason: 'bootstrap_not_found' }, { status: 404 })
+        }
+        if (bootstrap.claimedAt !== null) {
+          return Response.json({ ok: false, reason: 'bootstrap_already_used' }, { status: 409 })
+        }
+        if (Date.now() > bootstrap.expiresAt) {
+          return Response.json({ ok: false, reason: 'bootstrap_expired' }, { status: 409 })
+        }
+        if (!body?.hostname || body.hostname !== bootstrap.hostname) {
+          return Response.json({ ok: false, reason: 'hostname_mismatch' }, { status: 409 })
+        }
+        if (!body?.bootstrapToken || body.bootstrapToken !== bootstrap.bootstrapToken) {
+          return Response.json({ ok: false, reason: 'invalid_bootstrap_token' }, { status: 401 })
+        }
+
+        const claimedAt = Date.now()
+        const hostToken = {
+          token: `${hostId}.${crypto.randomUUID()}`,
+          issuedAt: claimedAt,
+        } satisfies HostAccessTokenRecord
+        await Promise.all([
+          this.ctx.storage.put(this.bootstrapKey(hostId), { ...bootstrap, claimedAt }),
+          this.ctx.storage.put(this.hostTokenKey(hostId), hostToken),
+        ])
+        return Response.json({ ok: true, hostId, token: hostToken.token, claimedAt })
+      }
+    }
+
+    const tokenVerifyMatch = url.pathname.match(/^\/control\/hosts\/([^/]+?)\/token\/verify$/)
+    if (tokenVerifyMatch) {
+      const hostId = decodeURIComponent(tokenVerifyMatch[1] ?? '')
+      if (!hostId) {
+        return Response.json({ ok: false, reason: 'host_id_required' }, { status: 400 })
+      }
+
+      if (request.method === 'POST') {
+        const body = (await request.json().catch(() => null)) as { token?: string } | null
+        const hostToken = await this.ctx.storage.get<HostAccessTokenRecord>(this.hostTokenKey(hostId))
+        const ok = Boolean(body?.token) && body?.token === hostToken?.token
+        return Response.json({ ok })
+      }
     }
 
     const controlMatch = url.pathname.match(/^\/control\/hosts\/([^/]+?)(?:\/(desired|current|applied))?$/)
@@ -181,11 +316,21 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
         return Response.json({ ok: false, reason: 'host_id_required' }, { status: 400 })
       }
 
+      if (request.method === 'GET' && action === null) {
+        const state = await this.readHostControlState(hostId)
+        if (!state.bootstrap && !state.desired && !state.current && !state.applied) {
+          return Response.json({ ok: false, reason: 'host_not_found' }, { status: 404 })
+        }
+        return Response.json(state)
+      }
+
       if (request.method === 'DELETE' && action === null) {
         await Promise.all([
+          this.ctx.storage.delete(this.bootstrapKey(hostId)),
           this.ctx.storage.delete(this.desiredKey(hostId)),
           this.ctx.storage.delete(this.currentKey(hostId)),
           this.ctx.storage.delete(this.appliedKey(hostId)),
+          this.ctx.storage.delete(this.hostTokenKey(hostId)),
         ])
         return Response.json({ ok: true })
       }
@@ -299,6 +444,14 @@ export class HostSession extends DurableObject<EdgeBindings> {
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'))
   }
 
+  private dispatchKey(generation: number) {
+    return `dispatch:${generation}`
+  }
+
+  private getRoutingStub() {
+    return this.env.ROUTING_DIRECTORY.get(this.env.ROUTING_DIRECTORY.idFromName('global'))
+  }
+
   private getHostSocket() {
     return this.ctx.getWebSockets('host')[0]
   }
@@ -383,6 +536,57 @@ export class HostSession extends DurableObject<EdgeBindings> {
     return new Response(null, { status: 101, webSocket: client })
   }
 
+  private async handleReconcileAck(message: ReconcileAckMessage) {
+    const dispatch = await this.ctx.storage.get<ConfigDispatchMessage>(this.dispatchKey(message.payload.generation))
+    if (!dispatch || dispatch.payload.hostId !== message.payload.hostId) {
+      return
+    }
+
+    const services = dispatch.payload.desired.services
+    const routing = this.getRoutingStub()
+
+    if (message.payload.status === 'error') {
+      await routing.fetch(
+        new Request(`https://routing.internal/control/hosts/${encodeURIComponent(message.payload.hostId)}/current`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            generation: message.payload.generation,
+            status: 'error',
+            services,
+            error: message.payload.error,
+          }),
+        }),
+      )
+      return
+    }
+
+    await routing.fetch(
+      new Request(`https://routing.internal/control/hosts/${encodeURIComponent(message.payload.hostId)}/current`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          generation: message.payload.generation,
+          status: 'acknowledged',
+          services,
+        }),
+      }),
+    )
+
+    if (message.payload.status === 'applied') {
+      await routing.fetch(
+        new Request(`https://routing.internal/control/hosts/${encodeURIComponent(message.payload.hostId)}/applied`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            generation: message.payload.generation,
+            services,
+          }),
+        }),
+      )
+    }
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url)
 
@@ -407,6 +611,13 @@ export class HostSession extends DurableObject<EdgeBindings> {
       }
       await this.ctx.storage.put('session', payload)
       return Response.json(payload)
+    }
+
+    if (request.method === 'POST' && url.pathname === '/control/dispatch') {
+      const message = configDispatchMessageSchema.parse(await request.json())
+      await this.ctx.storage.put(this.dispatchKey(message.payload.generation), message)
+      this.getHostSocket()?.send(JSON.stringify(message))
+      return Response.json({ ok: true })
     }
 
     if (request.method === 'POST' && url.pathname === '/relay-http') {
@@ -472,6 +683,16 @@ export class HostSession extends DurableObject<EdgeBindings> {
         ) {
           await this.ctx.storage.put('session', markSessionHeartbeat(session, Date.parse(heartbeat.payload.timestamp)))
         }
+        return
+      }
+
+      let reconcileAck: ReconcileAckMessage | null = null
+      try {
+        reconcileAck = reconcileAckMessageSchema.parse(JSON.parse(text))
+      } catch {}
+
+      if (reconcileAck) {
+        await this.handleReconcileAck(reconcileAck)
         return
       }
 
