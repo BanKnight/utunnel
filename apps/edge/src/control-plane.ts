@@ -7,7 +7,9 @@ import type {
   RoutingEntry,
   ServiceDefinition,
 } from '@utunnel/protocol'
-import { isSessionHealthy, normalizeServiceDefinitions } from './lib'
+import { configDispatchMessageSchema, serviceDefinitionSchema } from '@utunnel/protocol'
+import { z } from 'zod'
+import { isHostnameInRootDomain, isSessionHealthy, normalizeServiceDefinitions } from './lib'
 import type { EdgeBindings, FetchStub } from './types'
 
 export type AppliedRouteProjection = {
@@ -34,6 +36,20 @@ export type HostControlState = {
   projectedRoutes: AppliedRouteProjection[]
 }
 
+export type ControlApiTokenMetadata = {
+  tokenId: string
+  prefix: string
+  label?: string
+  createdAt: number
+  rotatedAt: number | null
+  revokedAt: number | null
+  lastUsedAt: number | null
+}
+
+export type ControlApiTokenSecret = ControlApiTokenMetadata & {
+  token: string
+}
+
 export type ControlPlaneHost = HostControlState & {
   runtime: {
     sessionId: string
@@ -43,6 +59,10 @@ export type ControlPlaneHost = HostControlState & {
     disconnectedAt: number | null
     serviceCount: number
   } | null
+}
+
+type ControlApiTokenCreateInput = {
+  label?: string | undefined
 }
 
 type ControlPlaneMutationResult<T> =
@@ -159,18 +179,60 @@ const buildBootstrapCommand = (input: {
   ].join('\n')
 }
 
-export const buildAppliedRouteProjections = (applied: AppliedHostConfig | null): AppliedRouteProjection[] => {
-  if (!applied) {
-    return []
+const normalizeAndValidateDesiredServices = (env: EdgeBindings, servicesInput: unknown) => {
+  const services = z.array(serviceDefinitionSchema).parse(servicesInput)
+  const normalizedServices = normalizeServiceDefinitions(services)
+
+  for (const service of normalizedServices) {
+    if (!isHostnameInRootDomain(service.subdomain, env.ROOT_DOMAIN)) {
+      throw new Error(`service_outside_root_domain:${service.subdomain}`)
+    }
   }
 
-  return applied.services.map((service) => ({
-    hostId: applied.hostId,
-    serviceId: service.serviceId,
-    hostname: service.subdomain,
-    generation: applied.generation,
-    projectedAt: applied.appliedAt,
-  }))
+  return normalizedServices
+}
+
+export const dispatchDesiredConfigToHost = async (env: EdgeBindings, hostId: string) => {
+  const desired = await getDesiredHostConfig(env, hostId)
+  if (!desired) {
+    return { ok: true as const, dispatched: false as const }
+  }
+
+  const message = configDispatchMessageSchema.parse({
+    type: 'config_dispatch',
+    payload: {
+      hostId,
+      generation: desired.generation,
+      desired,
+      dispatchedAt: Date.now(),
+      idempotencyKey: crypto.randomUUID(),
+    },
+  })
+
+  const response = await getHostStub(env, hostId).fetch(
+    toJsonRequest('https://host.internal/control/dispatch', message),
+  )
+
+  if (!response.ok) {
+    return { ok: false as const, status: response.status }
+  }
+
+  return { ok: true as const, dispatched: true as const, generation: desired.generation }
+}
+
+export const applyDesiredHostServices = async (
+  env: EdgeBindings,
+  hostId: string,
+  servicesInput: unknown,
+): Promise<ControlPlaneMutationResult<DesiredHostConfig>> => {
+  const services = normalizeAndValidateDesiredServices(env, servicesInput)
+  const result = await upsertDesiredHostServices(env, hostId, services)
+  if (!result.ok) {
+    return result
+  }
+
+  await dispatchDesiredConfigToHost(env, hostId)
+  return result
 }
 
 export const getHostControlState = async (env: EdgeBindings, hostId: string): Promise<HostControlState | null> => {
@@ -315,6 +377,58 @@ export const verifyHostAccessToken = async (env: EdgeBindings, hostId: string, t
 
   const json = (await response.json()) as { ok: boolean }
   return json.ok
+}
+
+export const verifyControlApiToken = async (env: EdgeBindings, token: string | null): Promise<boolean> => {
+  if (!token) {
+    return false
+  }
+
+  const response = await getControlPlaneStub(env).fetch(
+    toJsonRequest('https://routing.internal/control/tokens/verify', { token }),
+  )
+
+  if (!response.ok) {
+    return false
+  }
+
+  const json = (await response.json()) as { ok: boolean }
+  return json.ok
+}
+
+export const listControlApiTokens = async (env: EdgeBindings): Promise<ControlApiTokenMetadata[]> => {
+  const response = await getControlPlaneStub(env).fetch('https://routing.internal/control/tokens')
+  return readJson<ControlApiTokenMetadata[]>(response)
+}
+
+export const createControlApiToken = async (
+  env: EdgeBindings,
+  input: ControlApiTokenCreateInput,
+): Promise<ControlPlaneMutationResult<ControlApiTokenSecret>> => {
+  const response = await getControlPlaneStub(env).fetch(
+    toJsonRequest('https://routing.internal/control/tokens', input),
+  )
+  return readMutationResult<ControlApiTokenSecret>(response)
+}
+
+export const rotateControlApiToken = async (
+  env: EdgeBindings,
+  tokenId: string,
+): Promise<ControlPlaneMutationResult<ControlApiTokenSecret>> => {
+  const response = await getControlPlaneStub(env).fetch(
+    toJsonRequest(`https://routing.internal/control/tokens/${encodeURIComponent(tokenId)}/rotate`, {}),
+  )
+  return readMutationResult<ControlApiTokenSecret>(response)
+}
+
+export const revokeControlApiToken = async (
+  env: EdgeBindings,
+  tokenId: string,
+): Promise<ControlPlaneMutationResult<ControlApiTokenMetadata>> => {
+  const response = await getControlPlaneStub(env).fetch(
+    toJsonRequest(`https://routing.internal/control/tokens/${encodeURIComponent(tokenId)}/revoke`, {}),
+  )
+  return readMutationResult<ControlApiTokenMetadata>(response)
 }
 
 export const listControlPlaneHosts = async (env: EdgeBindings): Promise<ControlPlaneHost[]> => {

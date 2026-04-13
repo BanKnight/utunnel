@@ -18,6 +18,7 @@ class FakeRoutingStub {
   private entries = new Map<string, RoutingEntry>()
   private bootstrap = new Map<string, { hostId: string; hostname: string; bootstrapToken: string; issuedAt: number; expiresAt: number; claimedAt: number | null }>()
   private hostTokens = new Map<string, { token: string; issuedAt: number }>()
+  private apiTokens = new Map<string, { tokenId: string; prefix: string; token: string; label?: string; createdAt: number; rotatedAt: number | null; revokedAt: number | null; lastUsedAt: number | null }>()
   private desired = new Map<string, HostControlState['desired']>()
   private current = new Map<string, HostControlState['current']>()
   private applied = new Map<string, HostControlState['applied']>()
@@ -91,6 +92,73 @@ class FakeRoutingStub {
       return Response.json(hostIds.flatMap((hostId) => this.readHostState(hostId).projectedRoutes))
     }
 
+    if (request.method === 'GET' && url.pathname === '/control/tokens') {
+      return Response.json(
+        Array.from(this.apiTokens.values()).map(({ token: _token, ...metadata }) => metadata),
+      )
+    }
+
+    if (request.method === 'POST' && url.pathname === '/control/tokens') {
+      const body = (await request.json().catch(() => null)) as { label?: string } | null
+      const tokenId = `token-${this.apiTokens.size + 1}`
+      const token = `utapi_${tokenId}`
+      const record = body?.label
+        ? {
+            tokenId,
+            prefix: token.slice(0, 12),
+            token,
+            label: body.label,
+            createdAt: Date.now(),
+            rotatedAt: null,
+            revokedAt: null,
+            lastUsedAt: null,
+          }
+        : {
+            tokenId,
+            prefix: token.slice(0, 12),
+            token,
+            createdAt: Date.now(),
+            rotatedAt: null,
+            revokedAt: null,
+            lastUsedAt: null,
+          }
+      this.apiTokens.set(tokenId, record)
+      return Response.json(record)
+    }
+
+    if (request.method === 'POST' && url.pathname === '/control/tokens/verify') {
+      const body = (await request.json().catch(() => null)) as { token?: string } | null
+      const record = Array.from(this.apiTokens.values()).find((item) => item.revokedAt === null && item.token === body?.token)
+      if (!record) {
+        return Response.json({ ok: false })
+      }
+      record.lastUsedAt = Date.now()
+      return Response.json({ ok: true, tokenId: record.tokenId })
+    }
+
+    const controlTokenMatch = url.pathname.match(/^\/control\/tokens\/([^/]+?)\/(rotate|revoke)$/)
+    if (controlTokenMatch && request.method === 'POST') {
+      const tokenId = decodeURIComponent(controlTokenMatch[1]!)
+      const action = controlTokenMatch[2]
+      const record = this.apiTokens.get(tokenId)
+      if (!record) {
+        return Response.json({ ok: false, reason: 'token_not_found' }, { status: 404 })
+      }
+
+      if (action === 'rotate') {
+        const nextToken = `utapi_${tokenId}-rotated`
+        record.token = nextToken
+        record.prefix = nextToken.slice(0, 12)
+        record.rotatedAt = Date.now()
+        record.lastUsedAt = null
+        return Response.json(record)
+      }
+
+      record.revokedAt = Date.now()
+      const { token: _token, ...metadata } = record
+      return Response.json(metadata)
+    }
+
     const bootstrapMatch = url.pathname.match(/^\/control\/hosts\/([^/]+?)\/bootstrap$/)
     if (bootstrapMatch && request.method === 'POST') {
       const hostId = decodeURIComponent(bootstrapMatch[1]!)
@@ -146,6 +214,14 @@ class FakeRoutingStub {
     if (controlMatch) {
       const hostId = decodeURIComponent(controlMatch[1]!)
       const action = controlMatch[2] ?? null
+
+      if (request.method === 'GET' && action === null) {
+        const state = this.readHostState(hostId)
+        if (!state.bootstrap && !state.desired && !state.current && !state.applied) {
+          return Response.json({ ok: false, reason: 'host_not_found' }, { status: 404 })
+        }
+        return Response.json(state)
+      }
 
       if (request.method === 'DELETE' && action === null) {
         this.bootstrap.delete(hostId)
@@ -394,6 +470,10 @@ class FakeHostStub {
       return Response.json({ ok: true })
     }
 
+    if (request.method === 'POST' && url.pathname === '/control/dispatch') {
+      return Response.json({ ok: true })
+    }
+
     if (request.method === 'GET' && url.pathname === '/session') {
       return Response.json(this.session)
     }
@@ -489,6 +569,239 @@ describe('edge app integration', () => {
     expect(loginResponse.status).toBe(200)
     expect(await loginResponse.text()).toBe('asset:/index.html')
     expect(env.ASSETS.lastPathname).toBe('/index.html')
+  })
+
+
+  test('supports control API tokens for REST and rejects them for host routes', async () => {
+    const env = {
+      ...createEnv(),
+      UI_PASSWORD: 'console-password',
+      SESSION_SECRET: 'session-secret',
+      SESSION_TTL_MS: '3600000',
+    }
+
+    const login = await app.request(
+      'http://edge.test/api/auth/login',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ password: 'console-password' }),
+      },
+      env,
+    )
+    const sessionCookie = login.headers.get('set-cookie')!
+
+    const createToken = await app.request(
+      'http://edge.test/api/control/tokens',
+      {
+        method: 'POST',
+        headers: {
+          cookie: sessionCookie,
+          authorization: 'Bearer dev-operator-token',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ label: 'cli' }),
+      },
+      env,
+    )
+    const createTokenJson = (await createToken.json()) as {
+      tokenId: string
+      prefix: string
+      token: string
+      label?: string
+    }
+
+    expect(createToken.status).toBe(200)
+    expect(createTokenJson.tokenId).toBeTypeOf('string')
+    expect(createTokenJson.token).toContain('utapi_')
+
+    const listWithApiToken = await app.request(
+      'http://edge.test/api/control/tokens',
+      {
+        headers: {
+          authorization: `Bearer ${createTokenJson.token}`,
+        },
+      },
+      env,
+    )
+    expect(listWithApiToken.status).toBe(200)
+
+    const trpcWithApiToken = await handleEdgeFetch(
+      new Request('http://edge.test/trpc/auth.me?batch=1&input=%7B%7D', {
+        headers: {
+          authorization: `Bearer ${createTokenJson.token}`,
+        },
+      }),
+      env,
+      { waitUntil() {}, passThroughOnException() {} },
+    )
+    expect(trpcWithApiToken.status).toBe(401)
+
+    const hostRouteWithApiToken = await app.request(
+      'http://edge.test/api/hosts/host-token-only/token/verify',
+      {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${createTokenJson.token}`,
+        },
+      },
+      env,
+    )
+    expect(hostRouteWithApiToken.status).toBe(401)
+
+    const operatorRestWithSessionOnly = await app.request(
+      'http://edge.test/api/control/tokens',
+      {
+        headers: { cookie: sessionCookie },
+      },
+      env,
+    )
+    expect(operatorRestWithSessionOnly.status).toBe(401)
+  })
+
+  test('rotates and revokes control API tokens', async () => {
+    const env = createEnv()
+
+    const createToken = await app.request(
+      'http://edge.test/api/control/tokens',
+      {
+        method: 'POST',
+        headers: {
+          authorization: 'Bearer dev-operator-token',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ label: 'rotate-me' }),
+      },
+      env,
+    )
+    const created = (await createToken.json()) as { tokenId: string; token: string }
+    expect(createToken.status).toBe(200)
+
+    const rotate = await app.request(
+      `http://edge.test/api/control/tokens/${created.tokenId}/rotate`,
+      {
+        method: 'POST',
+        headers: { authorization: 'Bearer dev-operator-token' },
+      },
+      env,
+    )
+    const rotated = (await rotate.json()) as { tokenId: string; token: string }
+    expect(rotate.status).toBe(200)
+    expect(rotated.tokenId).toBe(created.tokenId)
+    expect(rotated.token).not.toBe(created.token)
+
+    const oldTokenDenied = await app.request(
+      'http://edge.test/api/control/tokens',
+      {
+        headers: { authorization: `Bearer ${created.token}` },
+      },
+      env,
+    )
+    expect(oldTokenDenied.status).toBe(401)
+
+    const revoke = await app.request(
+      `http://edge.test/api/control/tokens/${created.tokenId}/revoke`,
+      {
+        method: 'POST',
+        headers: { authorization: 'Bearer dev-operator-token' },
+      },
+      env,
+    )
+    expect(revoke.status).toBe(200)
+
+    const revokedDenied = await app.request(
+      'http://edge.test/api/control/tokens',
+      {
+        headers: { authorization: `Bearer ${rotated.token}` },
+      },
+      env,
+    )
+    expect(revokedDenied.status).toBe(401)
+  })
+
+  test('shares desired validation and dispatch between REST and tRPC import', async () => {
+    const env = {
+      ...createEnv(),
+      UI_PASSWORD: 'console-password',
+      SESSION_SECRET: 'session-secret',
+      SESSION_TTL_MS: '3600000',
+    }
+
+    const executionCtx = { waitUntil() {}, passThroughOnException() {} }
+    let cookieHeader: string | null = null
+
+    const client = createTRPCProxyClient<AppRouter>({
+      links: [
+        httpBatchLink({
+          url: 'http://edge.test/trpc',
+          fetch: async (url, options) => {
+            const headers = new Headers(options?.headers)
+            if (cookieHeader) {
+              headers.set('cookie', cookieHeader)
+            }
+
+            const requestInit: RequestInit = {
+              method: options?.method ?? 'GET',
+              headers,
+            }
+            if (options && 'body' in options) {
+              requestInit.body = options.body ?? null
+            }
+
+            const response = await handleEdgeFetch(new Request(String(url), requestInit), env, executionCtx)
+            const setCookie = response.headers.get('set-cookie')
+            if (setCookie) {
+              cookieHeader = setCookie.split(';')[0] ?? null
+            }
+            return response
+          },
+        }),
+      ],
+    })
+
+    await client.auth.login.mutate({ password: 'console-password' })
+
+    await expect(
+      client.hosts.importStaticConfig.mutate({
+        hostId: 'host-import',
+        services: [
+          {
+            serviceId: 'svc-bad',
+            serviceName: 'bad',
+            localUrl: 'http://127.0.0.1:3001',
+            protocol: 'http',
+            subdomain: 'bad.other.test',
+          },
+        ],
+      }),
+    ).rejects.toThrow()
+
+    const imported = await client.hosts.importStaticConfig.mutate({
+      hostId: 'host-import',
+      services: [
+        {
+          serviceId: 'svc-good',
+          serviceName: 'good',
+          localUrl: 'http://127.0.0.1:3001',
+          protocol: 'http',
+          subdomain: 'good.example.test',
+        },
+      ],
+    })
+
+    expect(imported.generation).toBe(1)
+
+    const desired = await app.request(
+      'http://edge.test/api/control/hosts',
+      { headers: { authorization: 'Bearer dev-operator-token' } },
+      env,
+    )
+    const desiredJson = (await desired.json()) as HostControlState[]
+    expect(desiredJson[0]?.desired?.services[0]?.subdomain).toBe('good.example.test')
+
+    const hostStub = env.HOST_SESSION.get('host-import') as unknown as { fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> }
+    const dispatchResponse = await hostStub.fetch('https://host.internal/control/dispatch', { method: 'POST' })
+    expect(dispatchResponse.status).toBe(200)
   })
 
   test('supports control shell tRPC login, me, summary, and logout flow', async () => {
@@ -735,6 +1048,69 @@ describe('edge app integration', () => {
     const legacyRoutesResponse = await app.request('http://edge.test/api/routes', { headers: operatorHeader }, env)
     const legacyRoutes = (await legacyRoutesResponse.json()) as RoutingEntry[]
     expect(legacyRoutes).toEqual([])
+  })
+
+  test('returns single host control state with runtime details', async () => {
+    const env = createEnv()
+    const operatorHeader = {
+      authorization: 'Bearer dev-operator-token',
+      'content-type': 'application/json',
+    }
+
+    const services = [
+      {
+        serviceId: 'svc-single-host',
+        serviceName: 'single-host',
+        localUrl: 'http://127.0.0.1:3310',
+        protocol: 'http' as const,
+        subdomain: 'single-host.example.test',
+      },
+    ]
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-single/desired',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ services }),
+      },
+      env,
+    )
+
+    await app.request(
+      'http://edge.test/api/hosts/host-single/services',
+      {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${buildHostToken('host-single', env.OPERATOR_TOKEN)}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          sessionId: 'session-single',
+          version: 1,
+          services,
+        }),
+      },
+      env,
+    )
+
+    const hostResponse = await app.request('http://edge.test/api/control/hosts/host-single', { headers: operatorHeader }, env)
+    const host = (await hostResponse.json()) as HostControlState & {
+      runtime: {
+        sessionId: string
+        version: number
+        healthy: boolean
+        lastHeartbeatAt: number | null
+        disconnectedAt: number | null
+        serviceCount: number
+      } | null
+    }
+
+    expect(hostResponse.status).toBe(200)
+    expect(host.hostId).toBe('host-single')
+    expect(host.desired?.generation).toBe(1)
+    expect(host.runtime?.sessionId).toBe('session-single')
+    expect(host.runtime?.serviceCount).toBe(1)
   })
 
   test('projects routes only after current ack and applied promotion', async () => {

@@ -71,6 +71,7 @@
     "packages/testkit": {
       "name": "@utunnel/testkit",
       "dependencies": {
+        "@trpc/client": "^11.0.0",
         "@utunnel/config": "workspace:*",
         "@utunnel/protocol": "workspace:*",
       },
