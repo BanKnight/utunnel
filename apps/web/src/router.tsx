@@ -114,6 +114,10 @@ const buildHostEditors = (hosts: ControlPlaneHost[]) => {
   return Object.fromEntries(hosts.map((host) => [host.hostId, buildEditableServices(host)])) as Record<string, ControlPlaneService[]>
 }
 
+const areServicesEqual = (left: ControlPlaneService[] | null | undefined, right: ControlPlaneService[] | null | undefined) => {
+  return JSON.stringify(left ?? []) === JSON.stringify(right ?? [])
+}
+
 const createDraftService = (hostId: string): ControlPlaneService => {
   const suffix = Date.now()
   return {
@@ -539,6 +543,8 @@ function HostsPage() {
       <div className="space-y-4">
         {hosts.map((host) => {
           const editableServices = hostEditors[host.hostId] ?? []
+          const savedServices = buildEditableServices(host)
+          const isDirty = !areServicesEqual(editableServices, savedServices)
           const hostNotice = hostNotices[host.hostId] ?? null
           return (
           <Card key={host.hostId} className="space-y-4">
@@ -580,7 +586,21 @@ function HostsPage() {
                   </Button>
                   <Button
                     type="button"
-                    disabled={savingHostId === host.hostId}
+                    className="bg-slate-800 text-slate-100 hover:bg-slate-700"
+                    disabled={!isDirty || savingHostId === host.hostId}
+                    onClick={() => {
+                      setHostNotices((current) => ({ ...current, [host.hostId]: null }))
+                      setHostEditors((current) => ({
+                        ...current,
+                        [host.hostId]: cloneServices(savedServices),
+                      }))
+                    }}
+                  >
+                    重置
+                  </Button>
+                  <Button
+                    type="button"
+                    disabled={savingHostId === host.hostId || !isDirty}
                     onClick={async () => {
                       setSavingHostId(host.hostId)
                       setHostNotices((current) => ({ ...current, [host.hostId]: null }))
@@ -611,6 +631,9 @@ function HostsPage() {
               {hostNotice ? (
                 <p className={hostNotice.tone === 'error' ? 'text-sm text-rose-400' : 'text-sm text-emerald-400'}>{hostNotice.text}</p>
               ) : null}
+              <p className={isDirty ? 'text-sm text-amber-400' : 'text-sm text-slate-500'}>
+                {isDirty ? '有未保存更改。' : '当前草稿已与已知配置同步。'}
+              </p>
               <div className="space-y-3">
                 {editableServices.length > 0 ? editableServices.map((service, index) => (
                   <div key={`${host.hostId}-${service.serviceId}-${index}`} className="grid gap-3 rounded-md border border-slate-800 p-3 md:grid-cols-2 xl:grid-cols-[1fr_1fr_1.2fr_140px_1fr_auto]">
