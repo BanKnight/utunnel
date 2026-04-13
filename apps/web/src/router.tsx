@@ -356,13 +356,13 @@ function HostsPage() {
   const [tokens, setTokens] = useState<ControlApiTokenMetadata[]>([])
   const [hostId, setHostId] = useState('')
   const [hostname, setHostname] = useState('')
-  const [importJson, setImportJson] = useState('')
+  const [importDrafts, setImportDrafts] = useState<Record<string, string>>({})
   const [command, setCommand] = useState<string | null>(null)
   const [tokenSecret, setTokenSecret] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [issuing, setIssuing] = useState(false)
   const [creatingToken, setCreatingToken] = useState(false)
-  const [importing, setImporting] = useState(false)
+  const [importingHostId, setImportingHostId] = useState<string | null>(null)
 
   const reloadHosts = async () => {
     const nextHosts = (await trpcClient.hosts.list.query()) as ControlPlaneHost[]
@@ -502,50 +502,13 @@ function HostsPage() {
           )) : <p className="text-sm text-slate-500">暂无 API tokens</p>}
         </div>
       </Card>
-      <Card className="space-y-4">
-        <div>
-          <h3 className="text-lg font-medium text-slate-50">导入 static config</h3>
-          <p className="text-sm text-slate-400">把旧静态 service 配置导入到 desired.services，并立即触发现有 dispatch。</p>
-        </div>
-        <form
-          className="space-y-3"
-          onSubmit={async (event) => {
-            event.preventDefault()
-            setImporting(true)
-            setError(null)
-            try {
-              const parsed = JSON.parse(importJson) as { services?: ControlPlaneService[] }
-              await trpcClient.hosts.importStaticConfig.mutate({
-                hostId,
-                services: parsed.services ?? [],
-              })
-              await reloadHosts()
-              setError(null)
-            } catch {
-              setError('导入 static config 失败。')
-            } finally {
-              setImporting(false)
-            }
-          }}
-        >
-          <Input placeholder="target host id" value={hostId} onChange={(event) => setHostId(event.target.value)} />
-          <textarea
-            className="min-h-40 w-full rounded-md border border-slate-800 bg-slate-950 p-3 text-sm text-slate-100"
-            placeholder='{"services":[...]}'
-            value={importJson}
-            onChange={(event) => setImportJson(event.target.value)}
-          />
-          <Button type="submit" disabled={importing || hostId.length === 0 || importJson.length === 0}>
-            {importing ? '导入中...' : '导入 static config'}
-          </Button>
-        </form>
-      </Card>
       <div className="space-y-4">
         {hosts.map((host) => {
           const editableServices = hostEditors[host.hostId] ?? []
           const savedServices = buildEditableServices(host)
           const isDirty = !areServicesEqual(editableServices, savedServices)
           const hostNotice = hostNotices[host.hostId] ?? null
+          const importDraft = importDrafts[host.hostId] ?? ''
           return (
           <Card key={host.hostId} className="space-y-4">
             <div className="flex items-center justify-between gap-4">
@@ -709,6 +672,53 @@ function HostsPage() {
                     </Button>
                   </div>
                 )) : <p className="text-sm text-slate-500">暂无 desired services，可直接新增。</p>}
+              </div>
+              <div className="rounded-md border border-dashed border-slate-800 p-4 space-y-3">
+                <div>
+                  <p className="text-sm font-medium text-slate-200">导入 static config</p>
+                  <p className="text-sm text-slate-500">把旧静态配置导入到当前 host 的 desired.services。</p>
+                </div>
+                <textarea
+                  className="min-h-32 w-full rounded-md border border-slate-800 bg-slate-950 p-3 text-sm text-slate-100"
+                  placeholder='{"services":[...]}'
+                  value={importDraft}
+                  onChange={(event) => {
+                    const value = event.target.value
+                    setImportDrafts((current) => ({ ...current, [host.hostId]: value }))
+                  }}
+                />
+                <div className="flex justify-end">
+                  <Button
+                    type="button"
+                    disabled={importingHostId === host.hostId || importDraft.length === 0}
+                    onClick={async () => {
+                      setImportingHostId(host.hostId)
+                      setHostNotices((current) => ({ ...current, [host.hostId]: null }))
+                      try {
+                        const parsed = JSON.parse(importDraft) as { services?: ControlPlaneService[] }
+                        await trpcClient.hosts.importStaticConfig.mutate({
+                          hostId: host.hostId,
+                          services: parsed.services ?? [],
+                        })
+                        await reloadHosts()
+                        setImportDrafts((current) => ({ ...current, [host.hostId]: '' }))
+                        setHostNotices((current) => ({
+                          ...current,
+                          [host.hostId]: { tone: 'success', text: 'static config 已导入。' },
+                        }))
+                      } catch {
+                        setHostNotices((current) => ({
+                          ...current,
+                          [host.hostId]: { tone: 'error', text: '导入 static config 失败。' },
+                        }))
+                      } finally {
+                        setImportingHostId(null)
+                      }
+                    }}
+                  >
+                    {importingHostId === host.hostId ? '导入中...' : '导入到该 Host'}
+                  </Button>
+                </div>
               </div>
             </div>
             <div className="grid gap-3 md:grid-cols-3">
