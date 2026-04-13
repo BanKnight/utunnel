@@ -102,6 +102,33 @@ type HostNotice = {
   text: string
 }
 
+type ServiceFieldError = Partial<Record<'serviceId' | 'serviceName' | 'localUrl' | 'subdomain', string>>
+
+type ServiceValidationResult = {
+  fieldErrors: ServiceFieldError[]
+  messages: string[]
+  hasErrors: boolean
+}
+
+const normalizeSubdomain = (subdomain: string) => {
+  const trimmed = subdomain.trim().toLowerCase().replace(/\.$/, '')
+  return trimmed.split(':')[0] ?? ''
+}
+
+const normalizeService = (service: ControlPlaneService): ControlPlaneService => {
+  return {
+    ...service,
+    serviceId: service.serviceId.trim(),
+    serviceName: service.serviceName.trim(),
+    localUrl: service.localUrl.trim(),
+    subdomain: normalizeSubdomain(service.subdomain),
+  }
+}
+
+const normalizeServices = (services: ControlPlaneService[] | null | undefined) => {
+  return (services ?? []).map((service) => normalizeService(service))
+}
+
 const cloneServices = (services: ControlPlaneService[] | null | undefined) => {
   return (services ?? []).map((service) => ({ ...service }))
 }
@@ -116,6 +143,87 @@ const buildHostEditors = (hosts: ControlPlaneHost[]) => {
 
 const areServicesEqual = (left: ControlPlaneService[] | null | undefined, right: ControlPlaneService[] | null | undefined) => {
   return JSON.stringify(left ?? []) === JSON.stringify(right ?? [])
+}
+
+const isValidSubdomain = (value: string) => {
+  return /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$/.test(value)
+}
+
+const isValidLocalUrl = (value: string, protocol: ServiceProtocol) => {
+  try {
+    const parsed = new URL(value)
+    if (protocol === 'http') {
+      return parsed.protocol === 'http:' || parsed.protocol === 'https:'
+    }
+    return parsed.protocol === 'ws:' || parsed.protocol === 'wss:'
+  } catch {
+    return false
+  }
+}
+
+const validateServices = (services: ControlPlaneService[]): ServiceValidationResult => {
+  const normalizedServices = normalizeServices(services)
+  const fieldErrors = normalizedServices.map<ServiceFieldError>(() => ({}))
+  const serviceIdRows = new Map<string, number[]>()
+  const subdomainRows = new Map<string, number[]>()
+
+  normalizedServices.forEach((service, index) => {
+    const serviceId = service.serviceId
+    const serviceName = service.serviceName
+    const localUrl = service.localUrl
+    const subdomain = service.subdomain
+
+    if (!serviceId) {
+      fieldErrors[index]!.serviceId = '请输入 service id'
+    } else {
+      serviceIdRows.set(serviceId, [...(serviceIdRows.get(serviceId) ?? []), index])
+    }
+
+    if (!serviceName) {
+      fieldErrors[index]!.serviceName = '请输入 service name'
+    }
+
+    if (!localUrl) {
+      fieldErrors[index]!.localUrl = '请输入 local url'
+    } else if (!isValidLocalUrl(localUrl, service.protocol)) {
+      fieldErrors[index]!.localUrl = service.protocol === 'http' ? 'HTTP 服务需使用 http(s) URL' : 'WebSocket 服务需使用 ws(s) URL'
+    }
+
+    if (!subdomain) {
+      fieldErrors[index]!.subdomain = '请输入 subdomain'
+    } else if (!isValidSubdomain(subdomain)) {
+      fieldErrors[index]!.subdomain = 'subdomain 格式不合法'
+    } else {
+      subdomainRows.set(subdomain, [...(subdomainRows.get(subdomain) ?? []), index])
+    }
+  })
+
+  for (const rows of serviceIdRows.values()) {
+    if (rows.length > 1) {
+      rows.forEach((row) => {
+        fieldErrors[row]!.serviceId = 'service id 不能重复'
+      })
+    }
+  }
+
+  for (const rows of subdomainRows.values()) {
+    if (rows.length > 1) {
+      rows.forEach((row) => {
+        fieldErrors[row]!.subdomain = 'subdomain 不能重复'
+      })
+    }
+  }
+
+  const messages = fieldErrors.flatMap((errors, index) => {
+    const labels = Object.values(errors)
+    return labels.length > 0 ? [`第 ${index + 1} 行有 ${labels.length} 个字段需要修正。`] : []
+  })
+
+  return {
+    fieldErrors,
+    messages,
+    hasErrors: messages.length > 0,
+  }
 }
 
 const createDraftService = (hostId: string): ControlPlaneService => {
@@ -506,6 +614,8 @@ function HostsPage() {
         {hosts.map((host) => {
           const editableServices = hostEditors[host.hostId] ?? []
           const savedServices = buildEditableServices(host)
+          const validation = validateServices(editableServices)
+          const rowErrors = validation.fieldErrors
           const isDirty = !areServicesEqual(editableServices, savedServices)
           const hostNotice = hostNotices[host.hostId] ?? null
           const importDraft = importDrafts[host.hostId] ?? ''
@@ -563,14 +673,23 @@ function HostsPage() {
                   </Button>
                   <Button
                     type="button"
-                    disabled={savingHostId === host.hostId || !isDirty}
+                    disabled={savingHostId === host.hostId || !isDirty || validation.hasErrors}
                     onClick={async () => {
+                      if (validation.hasErrors) {
+                        setHostNotices((current) => ({
+                          ...current,
+                          [host.hostId]: { tone: 'error', text: '请先修正表单中的字段错误。' },
+                        }))
+                        return
+                      }
+
+                      const normalizedServices = normalizeServices(editableServices)
                       setSavingHostId(host.hostId)
                       setHostNotices((current) => ({ ...current, [host.hostId]: null }))
                       try {
                         await trpcClient.hosts.upsertDesired.mutate({
                           hostId: host.hostId,
-                          services: editableServices,
+                          services: normalizedServices,
                         })
                         await reloadHosts()
                         setHostNotices((current) => ({
@@ -598,80 +717,103 @@ function HostsPage() {
                 {isDirty ? '有未保存更改。' : '当前草稿已与已知配置同步。'}
               </p>
               <div className="space-y-3">
-                {editableServices.length > 0 ? editableServices.map((service, index) => (
-                  <div key={`${host.hostId}-${service.serviceId}-${index}`} className="grid gap-3 rounded-md border border-slate-800 p-3 md:grid-cols-2 xl:grid-cols-[1fr_1fr_1.2fr_140px_1fr_auto]">
-                    <Input
-                      placeholder="service id"
-                      value={service.serviceId}
-                      onChange={(event) => {
-                        const value = event.target.value
-                        setHostEditors((current) => ({
-                          ...current,
-                          [host.hostId]: (current[host.hostId] ?? []).map((item, itemIndex) => itemIndex === index ? { ...item, serviceId: value } : item),
-                        }))
-                      }}
-                    />
-                    <Input
-                      placeholder="service name"
-                      value={service.serviceName}
-                      onChange={(event) => {
-                        const value = event.target.value
-                        setHostEditors((current) => ({
-                          ...current,
-                          [host.hostId]: (current[host.hostId] ?? []).map((item, itemIndex) => itemIndex === index ? { ...item, serviceName: value } : item),
-                        }))
-                      }}
-                    />
-                    <Input
-                      placeholder="local url"
-                      value={service.localUrl}
-                      onChange={(event) => {
-                        const value = event.target.value
-                        setHostEditors((current) => ({
-                          ...current,
-                          [host.hostId]: (current[host.hostId] ?? []).map((item, itemIndex) => itemIndex === index ? { ...item, localUrl: value } : item),
-                        }))
-                      }}
-                    />
-                    <select
-                      className="flex h-10 w-full rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-sky-500"
-                      value={service.protocol}
-                      onChange={(event) => {
-                        const value = event.target.value as ServiceProtocol
-                        setHostEditors((current) => ({
-                          ...current,
-                          [host.hostId]: (current[host.hostId] ?? []).map((item, itemIndex) => itemIndex === index ? { ...item, protocol: value } : item),
-                        }))
-                      }}
-                    >
-                      <option value="http">http</option>
-                      <option value="websocket">websocket</option>
-                    </select>
-                    <Input
-                      placeholder="subdomain"
-                      value={service.subdomain}
-                      onChange={(event) => {
-                        const value = event.target.value
-                        setHostEditors((current) => ({
-                          ...current,
-                          [host.hostId]: (current[host.hostId] ?? []).map((item, itemIndex) => itemIndex === index ? { ...item, subdomain: value } : item),
-                        }))
-                      }}
-                    />
-                    <Button
-                      type="button"
-                      className="bg-slate-800 text-slate-100 hover:bg-slate-700"
-                      onClick={() => {
-                        setHostEditors((current) => ({
-                          ...current,
-                          [host.hostId]: (current[host.hostId] ?? []).filter((_, itemIndex) => itemIndex !== index),
-                        }))
-                      }}
-                    >
-                      删除
-                    </Button>
+                {validation.messages.length > 0 ? (
+                  <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-300">
+                    {validation.messages.join(' ')}
                   </div>
-                )) : <p className="text-sm text-slate-500">暂无 desired services，可直接新增。</p>}
+                ) : null}
+                {editableServices.length > 0 ? editableServices.map((service, index) => {
+                  const rowError = rowErrors[index] ?? {}
+                  return (
+                  <div key={`${host.hostId}-${service.serviceId}-${index}`} className="space-y-2 rounded-md border border-slate-800 p-3">
+                    <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-[1fr_1fr_1.2fr_140px_1fr_auto]">
+                      <div className="space-y-1">
+                        <Input
+                          placeholder="service id"
+                          value={service.serviceId}
+                          onChange={(event) => {
+                            const value = event.target.value
+                            setHostEditors((current) => ({
+                              ...current,
+                              [host.hostId]: (current[host.hostId] ?? []).map((item, itemIndex) => itemIndex === index ? { ...item, serviceId: value } : item),
+                            }))
+                          }}
+                        />
+                        {rowError.serviceId ? <p className="text-xs text-rose-400">{rowError.serviceId}</p> : null}
+                      </div>
+                      <div className="space-y-1">
+                        <Input
+                          placeholder="service name"
+                          value={service.serviceName}
+                          onChange={(event) => {
+                            const value = event.target.value
+                            setHostEditors((current) => ({
+                              ...current,
+                              [host.hostId]: (current[host.hostId] ?? []).map((item, itemIndex) => itemIndex === index ? { ...item, serviceName: value } : item),
+                            }))
+                          }}
+                        />
+                        {rowError.serviceName ? <p className="text-xs text-rose-400">{rowError.serviceName}</p> : null}
+                      </div>
+                      <div className="space-y-1">
+                        <Input
+                          placeholder="local url"
+                          value={service.localUrl}
+                          onChange={(event) => {
+                            const value = event.target.value
+                            setHostEditors((current) => ({
+                              ...current,
+                              [host.hostId]: (current[host.hostId] ?? []).map((item, itemIndex) => itemIndex === index ? { ...item, localUrl: value } : item),
+                            }))
+                          }}
+                        />
+                        {rowError.localUrl ? <p className="text-xs text-rose-400">{rowError.localUrl}</p> : null}
+                      </div>
+                      <div className="space-y-1">
+                        <select
+                          className="flex h-10 w-full rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-sky-500"
+                          value={service.protocol}
+                          onChange={(event) => {
+                            const value = event.target.value as ServiceProtocol
+                            setHostEditors((current) => ({
+                              ...current,
+                              [host.hostId]: (current[host.hostId] ?? []).map((item, itemIndex) => itemIndex === index ? { ...item, protocol: value } : item),
+                            }))
+                          }}
+                        >
+                          <option value="http">http</option>
+                          <option value="websocket">websocket</option>
+                        </select>
+                      </div>
+                      <div className="space-y-1">
+                        <Input
+                          placeholder="subdomain"
+                          value={service.subdomain}
+                          onChange={(event) => {
+                            const value = event.target.value
+                            setHostEditors((current) => ({
+                              ...current,
+                              [host.hostId]: (current[host.hostId] ?? []).map((item, itemIndex) => itemIndex === index ? { ...item, subdomain: value } : item),
+                            }))
+                          }}
+                        />
+                        {rowError.subdomain ? <p className="text-xs text-rose-400">{rowError.subdomain}</p> : null}
+                      </div>
+                      <Button
+                        type="button"
+                        className="bg-slate-800 text-slate-100 hover:bg-slate-700"
+                        onClick={() => {
+                          setHostEditors((current) => ({
+                            ...current,
+                            [host.hostId]: (current[host.hostId] ?? []).filter((_, itemIndex) => itemIndex !== index),
+                          }))
+                        }}
+                      >
+                        删除
+                      </Button>
+                    </div>
+                  </div>
+                )}) : <p className="text-sm text-slate-500">暂无 desired services，可直接新增。</p>}
               </div>
               <div className="rounded-md border border-dashed border-slate-800 p-4 space-y-3">
                 <div>
@@ -696,9 +838,19 @@ function HostsPage() {
                       setHostNotices((current) => ({ ...current, [host.hostId]: null }))
                       try {
                         const parsed = JSON.parse(importDraft) as { services?: ControlPlaneService[] }
+                        const normalizedServices = normalizeServices(parsed.services ?? [])
+                        const importValidation = validateServices(normalizedServices)
+                        if (importValidation.hasErrors) {
+                          setHostNotices((current) => ({
+                            ...current,
+                            [host.hostId]: { tone: 'error', text: '导入内容包含无效 service 字段，请先修正后再导入。' },
+                          }))
+                          return
+                        }
+
                         await trpcClient.hosts.importStaticConfig.mutate({
                           hostId: host.hostId,
-                          services: parsed.services ?? [],
+                          services: normalizedServices,
                         })
                         await reloadHosts()
                         setImportDrafts((current) => ({ ...current, [host.hostId]: '' }))
