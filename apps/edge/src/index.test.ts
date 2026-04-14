@@ -121,6 +121,24 @@ class FakeRoutingStub {
       )
     }
 
+    if (request.method === 'POST' && url.pathname === '/control/probes/record') {
+      const body = (await request.json()) as {
+        hostId: string
+        serviceId: string
+        checkedAt: number
+        success: boolean
+        statusCode?: number
+        latencyMs?: number
+        failureKind?: string
+      }
+      const key = `${body.hostId}:${body.serviceId}`
+      const nextResults = [body, ...(this.probeResults.get(key) ?? [])]
+        .sort((left, right) => right.checkedAt - left.checkedAt)
+        .slice(0, 5)
+      this.probeResults.set(key, nextResults)
+      return Response.json({ ok: true })
+    }
+
     if (request.method === 'GET' && url.pathname === '/control/tokens') {
       return Response.json(
         Array.from(this.apiTokens.values()).map(({ token: _token, ...metadata }) => metadata),
@@ -1908,6 +1926,105 @@ describe('edge app integration', () => {
     expect(host1.lastRelayHttp?.request.payload.serviceId).toBe('svc-a')
     expect(host2.lastRelayHttp?.request.payload.serviceId).toBe('svc-b')
     expect(host3.lastRelayHttp?.request.payload.serviceId).toBe('svc-c')
+  })
+
+
+  test('records reachability observations from tunnel traffic', async () => {
+    const env = createEnv()
+    const authHeader = {
+      authorization: `Bearer ${buildHostToken('host-1', env.OPERATOR_TOKEN)}`,
+      'content-type': 'application/json',
+    }
+    const operatorHeader = {
+      authorization: 'Bearer dev-operator-token',
+      'content-type': 'application/json',
+    }
+
+    const services = [
+      {
+        serviceId: 'svc-traffic',
+        serviceName: 'traffic',
+        localUrl: 'http://127.0.0.1:3001',
+        protocol: 'http' as const,
+        subdomain: 'traffic.example.test',
+      },
+    ]
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-1/desired',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ services }),
+      },
+      env,
+    )
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-1/current',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({
+          generation: 1,
+          status: 'acknowledged',
+          services,
+        }),
+      },
+      env,
+    )
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-1/applied',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ generation: 1, services }),
+      },
+      env,
+    )
+
+    await app.request(
+      'http://edge.test/api/hosts/host-1/services',
+      {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({
+          sessionId: 'session-traffic-1',
+          version: 1,
+          services,
+        }),
+      },
+      env,
+    )
+
+    const tunnelResponse = await app.request(
+      'http://edge.test/tunnel/live',
+      {
+        headers: {
+          host: 'traffic.example.test',
+        },
+      },
+      env,
+    )
+    expect(tunnelResponse.status).toBe(200)
+
+    const reachabilityResponse = await app.request(
+      'http://edge.test/api/control/services/reachability',
+      { headers: { authorization: 'Bearer dev-operator-token' } },
+      env,
+    )
+    const summaries = (await reachabilityResponse.json()) as Array<{
+      serviceId: string
+      recentResults: Array<{ success: boolean; statusCode?: number }>
+      checkedAt: number | null
+    }>
+
+    expect(reachabilityResponse.status).toBe(200)
+    expect(summaries[0]?.serviceId).toBe('svc-traffic')
+    expect(summaries[0]?.recentResults[0]?.success).toBe(true)
+    expect(summaries[0]?.recentResults[0]?.statusCode).toBe(200)
+    expect(summaries[0]?.checkedAt).not.toBeNull()
   })
 
   test('relays public tunnel request to owning host', async () => {

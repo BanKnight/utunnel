@@ -76,9 +76,9 @@ type ProbeExecutionResult = {
   serviceId: string
   checkedAt: number
   success: boolean
-  statusCode?: number
-  latencyMs?: number
-  failureKind?: ServiceProbeFailureKind
+  statusCode?: number | undefined
+  latencyMs?: number | undefined
+  failureKind?: ServiceProbeFailureKind | undefined
 }
 
 type HostControlState = {
@@ -109,9 +109,9 @@ type ConnectionRole =
   | { type: 'host' }
   | { type: 'client'; streamId: string }
 
-export class RoutingDirectory extends DurableObject<EdgeBindings> {
-  private static readonly PROBE_INTERVAL_MS = 30_000
+type ReachabilityObservation = ProbeExecutionResult
 
+export class RoutingDirectory extends DurableObject<EdgeBindings> {
   private static readonly PROBE_HISTORY_LIMIT = 5
 
   private bootstrapKey(hostId: string) {
@@ -263,9 +263,18 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
     })
   }
 
-  private async recordProbeResult(result: ProbeExecutionResult) {
+  private async recordProbeResult(result: ReachabilityObservation) {
     const record = serviceProbeRecordSchema.parse(result)
     await this.ctx.storage.put(this.probeKey(result.hostId, result.serviceId, result.checkedAt), record)
+    const entries = await this.ctx.storage.list<ServiceProbeRecord>({ prefix: this.probePrefix(result.hostId, result.serviceId) })
+    const staleKeys = Array.from(entries.entries())
+      .sort((left, right) => right[1].checkedAt - left[1].checkedAt)
+      .slice(RoutingDirectory.PROBE_HISTORY_LIMIT)
+      .map(([key]) => key)
+
+    if (staleKeys.length > 0) {
+      await Promise.all(staleKeys.map((key) => this.ctx.storage.delete(key)))
+    }
   }
 
   private async executeServiceProbe(hostId: string, service: ServiceDefinition): Promise<ProbeExecutionResult> {
@@ -335,8 +344,8 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
     }
   }
 
-  private scheduleNextProbeRun(delayMs = RoutingDirectory.PROBE_INTERVAL_MS) {
-    this.ctx.storage.setAlarm(Date.now() + delayMs)
+  private scheduleNextProbeRun(_delayMs = 30_000) {
+    return
   }
 
   private async readHostControlState(hostId: string): Promise<HostControlState> {
@@ -454,10 +463,14 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
       return Response.json(await this.listServiceReachabilitySummaries())
     }
 
-    if (request.method === 'POST' && url.pathname === '/control/probes/run') {
-      await this.runReachabilityProbePass()
-      this.scheduleNextProbeRun()
+    if (request.method === 'POST' && url.pathname === '/control/probes/record') {
+      const result = serviceProbeRecordSchema.parse(await request.json())
+      await this.recordProbeResult(result)
       return Response.json({ ok: true })
+    }
+
+    if (request.method === 'POST' && url.pathname === '/control/probes/run') {
+      return Response.json({ ok: true, mode: 'disabled' })
     }
 
     if (request.method === 'GET' && url.pathname === '/control/tokens') {
@@ -687,7 +700,6 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
             updatedAt: Date.now(),
           })
           await this.ctx.storage.put(this.desiredKey(hostId), desired)
-          this.scheduleNextProbeRun()
           return Response.json(desired)
         } catch (error) {
           return Response.json(
@@ -764,7 +776,6 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
           }
 
           await this.ctx.storage.put(this.appliedKey(hostId), applied)
-          this.scheduleNextProbeRun()
           return Response.json(applied)
         } catch (error) {
           return Response.json(
@@ -779,15 +790,7 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
   }
 
   async alarm() {
-    try {
-      await this.runReachabilityProbePass()
-    } catch (error) {
-      console.error('reachability_alarm_failed', {
-        reason: error instanceof Error ? error.message : 'unknown_error',
-      })
-    } finally {
-      this.scheduleNextProbeRun()
-    }
+    return
   }
 }
 

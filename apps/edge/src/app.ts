@@ -63,12 +63,48 @@ const toJsonRequest = (url: string, body: unknown, method = 'POST') => {
 const unauthorized = (reason = 'unauthorized') => Response.json({ ok: false, reason }, { status: 401 })
 const badRequest = (reason: string) => Response.json({ ok: false, reason }, { status: 400 })
 
+type ExecutionContextLike = {
+  waitUntil?: (promise: Promise<unknown>) => void
+}
+
 const getRoutingStub = (env: EdgeBindings) => {
   return env.ROUTING_DIRECTORY.get(env.ROUTING_DIRECTORY.idFromName('global'))
 }
 
 const getHostStub = (env: EdgeBindings, hostId: string) => {
   return env.HOST_SESSION.get(env.HOST_SESSION.idFromName(hostId))
+}
+
+const persistReachabilityObservation = async (
+  env: EdgeBindings,
+  observation: {
+    hostId: string
+    serviceId: string
+    checkedAt: number
+    success: boolean
+    statusCode?: number
+    latencyMs?: number
+    failureKind?: 'status-code' | 'edge'
+  },
+) => {
+  try {
+    await getRoutingStub(env).fetch(toJsonRequest('https://routing.internal/control/probes/record', observation))
+  } catch (error) {
+    console.error('reachability_observation_persist_failed', {
+      hostId: observation.hostId,
+      serviceId: observation.serviceId,
+      reason: error instanceof Error ? error.message : 'unknown_error',
+    })
+  }
+}
+
+const waitOrRun = async (executionCtx: ExecutionContextLike | undefined, task: Promise<unknown>) => {
+  if (executionCtx?.waitUntil) {
+    executionCtx.waitUntil(task)
+    return
+  }
+
+  await task
 }
 
 const requireHostAuthorization = async (request: Request, hostId: string, env: EdgeBindings) => {
@@ -241,7 +277,11 @@ type RelayWebSocketRequest = {
   request: WebSocketOpenMessage
 }
 
-export const handleTunnelRequest = async (request: Request, env: EdgeBindings) => {
+export const handleTunnelRequest = async (
+  request: Request,
+  env: EdgeBindings,
+  executionCtx?: ExecutionContextLike,
+) => {
   const hostname = resolveIngressHostname(request.url, request.headers.get('host'), request.headers.get('x-utunnel-route-host'))
   if (!isHostnameInRootDomain(hostname, env.ROOT_DOMAIN)) {
     return Response.json({ error: 'host_outside_root_domain' }, { status: 404 })
@@ -312,7 +352,47 @@ export const handleTunnelRequest = async (request: Request, env: EdgeBindings) =
     },
   }
 
-  return hostStub.fetch(toJsonRequest('https://host.internal/relay-http', relayRequest))
+  const startedAt = Date.now()
+  try {
+    const response = await hostStub.fetch(toJsonRequest('https://host.internal/relay-http', relayRequest))
+    const checkedAt = Date.now()
+    const statusCode = response.status
+    const success = statusCode < 500
+    const observation = success
+      ? persistReachabilityObservation(env, {
+          hostId: route.hostId,
+          serviceId: route.serviceId,
+          checkedAt,
+          success: true,
+          statusCode,
+          latencyMs: checkedAt - startedAt,
+        })
+      : persistReachabilityObservation(env, {
+          hostId: route.hostId,
+          serviceId: route.serviceId,
+          checkedAt,
+          success: false,
+          statusCode,
+          latencyMs: checkedAt - startedAt,
+          failureKind: 'status-code',
+        })
+    await waitOrRun(executionCtx, observation)
+    return response
+  } catch (error) {
+    const checkedAt = Date.now()
+    await waitOrRun(
+      executionCtx,
+      persistReachabilityObservation(env, {
+        hostId: route.hostId,
+        serviceId: route.serviceId,
+        checkedAt,
+        success: false,
+        latencyMs: checkedAt - startedAt,
+        failureKind: 'edge',
+      }),
+    )
+    throw error
+  }
 }
 
 export const createEdgeApp = () => {

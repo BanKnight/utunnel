@@ -12,8 +12,8 @@ export const handleEdgeFetch = async (
   executionCtx?: ExecutionContextLike,
 ) => {
   const url = new URL(request.url)
-  if (request.headers.get('Upgrade')?.toLowerCase() === 'websocket' && url.pathname.startsWith('/tunnel/')) {
-    return handleTunnelRequest(request, env)
+  if (url.pathname.startsWith('/tunnel/')) {
+    return handleTunnelRequest(request, env, executionCtx)
   }
 
   const response = await app.fetch(request, env, executionCtx as ExecutionContext)
