@@ -7,11 +7,12 @@
   ],
   "scripts": {
     "dev:edge": "bun --cwd apps/edge run dev",
+    "dev:edge-tail": "bun --cwd apps/edge-tail run dev",
     "dev:agent": "bun --cwd apps/agent run dev",
     "demo:v1": "bun run smoke:v1",
     "smoke:v1": "bun run packages/testkit/src/v1-smoke.ts",
     "smoke:v2": "bun run packages/testkit/src/v2-smoke.ts",
-    "typecheck": "bun x tsc --noEmit -p packages/protocol/tsconfig.json && bun x tsc --noEmit -p packages/config/tsconfig.json && bun x tsc --noEmit -p packages/testkit/tsconfig.json && bun x tsc --noEmit -p apps/edge/tsconfig.json && bun x tsc --noEmit -p apps/agent/tsconfig.json && bun x tsc --noEmit -p apps/web/tsconfig.json",
+    "typecheck": "bun x tsc --noEmit -p packages/protocol/tsconfig.json && bun x tsc --noEmit -p packages/config/tsconfig.json && bun x tsc --noEmit -p packages/testkit/tsconfig.json && bun x tsc --noEmit -p apps/edge/tsconfig.json && bun x tsc --noEmit -p apps/edge-tail/tsconfig.json && bun x tsc --noEmit -p apps/agent/tsconfig.json && bun x tsc --noEmit -p apps/web/tsconfig.json",
     "test": "bun test ./packages ./apps",
     "check": "bun run typecheck && bun run test"
   },

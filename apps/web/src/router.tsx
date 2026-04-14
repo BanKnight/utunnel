@@ -1,6 +1,6 @@
 import { createRootRouteWithContext, createRoute, createRouter, Outlet, redirect } from '@tanstack/react-router'
 import { useSetAtom } from 'jotai'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { currentUserAtom, sessionReadyAtom, type SessionUser } from './state/session'
 import { trpcClient } from './lib/trpc'
 import { Button } from './components/ui/button'
@@ -62,6 +62,10 @@ type ControlPlaneService = {
   localUrl: string
   protocol: ServiceProtocol
   subdomain: string
+}
+
+type ControlPlaneServiceDraft = ControlPlaneService & {
+  rowId: string
 }
 
 type ControlPlaneHost = {
@@ -139,6 +143,21 @@ type ServiceValidationResult = {
   hasErrors: boolean
 }
 
+const createServiceRowId = () => {
+  return `svc-row-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+const toServiceDraft = (service: ControlPlaneService): ControlPlaneServiceDraft => {
+  return {
+    rowId: createServiceRowId(),
+    ...service,
+  }
+}
+
+const stripServiceDrafts = (services: ControlPlaneServiceDraft[] | null | undefined) => {
+  return (services ?? []).map(({ rowId: _rowId, ...service }) => service)
+}
+
 const normalizeSubdomain = (subdomain: string) => {
   const trimmed = subdomain.trim().toLowerCase().replace(/\.$/, '')
   return trimmed.split(':')[0] ?? ''
@@ -162,16 +181,63 @@ const cloneServices = (services: ControlPlaneService[] | null | undefined) => {
   return (services ?? []).map((service) => ({ ...service }))
 }
 
+const cloneServiceDrafts = (services: ControlPlaneServiceDraft[] | null | undefined) => {
+  return (services ?? []).map((service) => ({ ...service }))
+}
+
+const buildBaselineServices = (host: ControlPlaneHost) => {
+  return normalizeServices(host.desired?.services ?? host.current?.services ?? host.applied?.services)
+}
+
 const buildEditableServices = (host: ControlPlaneHost) => {
-  return cloneServices(host.desired?.services ?? host.current?.services ?? host.applied?.services)
+  return buildBaselineServices(host).map(toServiceDraft)
 }
 
 const buildHostEditors = (hosts: ControlPlaneHost[]) => {
-  return Object.fromEntries(hosts.map((host) => [host.hostId, buildEditableServices(host)])) as Record<string, ControlPlaneService[]>
+  return Object.fromEntries(hosts.map((host) => [host.hostId, buildEditableServices(host)])) as Record<string, ControlPlaneServiceDraft[]>
 }
 
-const areServicesEqual = (left: ControlPlaneService[] | null | undefined, right: ControlPlaneService[] | null | undefined) => {
-  return JSON.stringify(left ?? []) === JSON.stringify(right ?? [])
+const mergeHostEditors = (
+  currentEditors: Record<string, ControlPlaneServiceDraft[]>,
+  previousHosts: ControlPlaneHost[],
+  nextHosts: ControlPlaneHost[],
+  syncHostIds: string[] = [],
+) => {
+  const syncHostIdSet = new Set(syncHostIds)
+  const previousHostsById = new Map(previousHosts.map((host) => [host.hostId, host]))
+
+  return Object.fromEntries(
+    nextHosts.map((host) => {
+      const nextBaseline = buildBaselineServices(host)
+      if (syncHostIdSet.has(host.hostId)) {
+        return [host.hostId, nextBaseline.map(toServiceDraft)]
+      }
+
+      const currentEditor = currentEditors[host.hostId]
+      if (!currentEditor) {
+        return [host.hostId, nextBaseline.map(toServiceDraft)]
+      }
+
+      const previousHost = previousHostsById.get(host.hostId)
+      if (!previousHost) {
+        return [host.hostId, cloneServiceDrafts(currentEditor)]
+      }
+
+      const previousBaseline = buildBaselineServices(previousHost)
+      if (areServicesEqual(currentEditor, previousBaseline)) {
+        return [host.hostId, nextBaseline.map(toServiceDraft)]
+      }
+
+      return [host.hostId, cloneServiceDrafts(currentEditor)]
+    }),
+  ) as Record<string, ControlPlaneServiceDraft[]>
+}
+
+const areServicesEqual = (
+  left: ControlPlaneServiceDraft[] | null | undefined,
+  right: ControlPlaneService[] | null | undefined,
+) => {
+  return JSON.stringify(normalizeServices(stripServiceDrafts(left))) === JSON.stringify(normalizeServices(right))
 }
 
 const isValidSubdomain = (value: string) => {
@@ -255,9 +321,10 @@ const validateServices = (services: ControlPlaneService[]): ServiceValidationRes
   }
 }
 
-const createDraftService = (hostId: string): ControlPlaneService => {
+const createDraftService = (hostId: string): ControlPlaneServiceDraft => {
   const suffix = Date.now()
   return {
+    rowId: createServiceRowId(),
     serviceId: `${hostId}-svc-${suffix}`,
     serviceName: '',
     localUrl: 'http://127.0.0.1:3000',
@@ -487,30 +554,36 @@ function DashboardPage() {
 function HostsPage() {
   const loaderData = hostsRoute.useLoaderData() as ControlPlaneHost[]
   const [hosts, setHosts] = useState<ControlPlaneHost[]>(loaderData)
-  const [hostEditors, setHostEditors] = useState<Record<string, ControlPlaneService[]>>(() => buildHostEditors(loaderData))
+  const hostsRef = useRef(loaderData)
+  const [hostEditors, setHostEditors] = useState<Record<string, ControlPlaneServiceDraft[]>>(() => buildHostEditors(loaderData))
   const [hostNotices, setHostNotices] = useState<Record<string, HostNotice | null>>({})
-  const [savingHostId, setSavingHostId] = useState<string | null>(null)
+  const [savingHostIds, setSavingHostIds] = useState<Record<string, boolean>>({})
   const [tokens, setTokens] = useState<ControlApiTokenMetadata[]>([])
   const [hostId, setHostId] = useState('')
   const [hostname, setHostname] = useState('')
   const [importDrafts, setImportDrafts] = useState<Record<string, string>>({})
   const [command, setCommand] = useState<string | null>(null)
   const [tokenSecret, setTokenSecret] = useState<string | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const [onboardingError, setOnboardingError] = useState<string | null>(null)
+  const [tokenError, setTokenError] = useState<string | null>(null)
   const [issuing, setIssuing] = useState(false)
   const [creatingToken, setCreatingToken] = useState(false)
   const [reachabilitySummaries, setReachabilitySummaries] = useState<ControlPlaneServiceReachabilitySummary[]>([])
-  const [importingHostId, setImportingHostId] = useState<string | null>(null)
+  const [importingHostIds, setImportingHostIds] = useState<Record<string, boolean>>({})
 
-  const reloadHosts = async () => {
+  const reloadHosts = async (syncHostIds: string[] = []) => {
+    const previousHosts = hostsRef.current
     const nextHosts = (await trpcClient.hosts.list.query()) as ControlPlaneHost[]
+    setHostEditors((currentEditors) => mergeHostEditors(currentEditors, previousHosts, nextHosts, syncHostIds))
+    hostsRef.current = nextHosts
     setHosts(nextHosts)
-    setHostEditors(buildHostEditors(nextHosts))
   }
 
   useEffect(() => {
+    const previousHosts = hostsRef.current
+    setHostEditors((currentEditors) => mergeHostEditors(currentEditors, previousHosts, loaderData))
+    hostsRef.current = loaderData
     setHosts(loaderData)
-    setHostEditors(buildHostEditors(loaderData))
   }, [loaderData])
 
   useEffect(() => {
@@ -542,7 +615,7 @@ function HostsPage() {
           onSubmit={async (event) => {
             event.preventDefault()
             setIssuing(true)
-            setError(null)
+            setOnboardingError(null)
             try {
               const result = (await trpcClient.hosts.issueBootstrap.mutate({
                 hostId,
@@ -551,7 +624,7 @@ function HostsPage() {
               })) as BootstrapIssueResult
               setCommand(result.command)
             } catch {
-              setError('生成 onboarding command 失败。')
+              setOnboardingError('生成 onboarding command 失败。')
             } finally {
               setIssuing(false)
             }
@@ -563,7 +636,7 @@ function HostsPage() {
             {issuing ? '生成中...' : '生成命令'}
           </Button>
         </form>
-        {error ? <p className="text-sm text-rose-400">{error}</p> : null}
+        {onboardingError ? <p className="text-sm text-rose-400">{onboardingError}</p> : null}
         {command ? (
           <div className="rounded-md border border-slate-800 bg-slate-950 p-4">
             <p className="mb-2 text-sm text-slate-400">Onboarding command</p>
@@ -582,13 +655,13 @@ function HostsPage() {
             disabled={creatingToken}
             onClick={async () => {
               setCreatingToken(true)
-              setError(null)
+              setTokenError(null)
               try {
                 const created = (await trpcClient.tokens.create.mutate({})) as ControlApiTokenSecret
                 setTokenSecret(created.token)
                 setTokens(await trpcClient.tokens.list.query() as ControlApiTokenMetadata[])
               } catch {
-                setError('创建 API token 失败。')
+                setTokenError('创建 API token 失败。')
               } finally {
                 setCreatingToken(false)
               }
@@ -597,6 +670,7 @@ function HostsPage() {
             {creatingToken ? '创建中...' : '创建 token'}
           </Button>
         </div>
+        {tokenError ? <p className="text-sm text-rose-400">{tokenError}</p> : null}
         {tokenSecret ? (
           <div className="rounded-md border border-slate-800 bg-slate-950 p-4">
             <p className="mb-2 text-sm text-slate-400">One-time token secret</p>
@@ -615,13 +689,13 @@ function HostsPage() {
                   type="button"
                   className="bg-slate-800 text-slate-100 hover:bg-slate-700"
                   onClick={async () => {
-                    setError(null)
+                    setTokenError(null)
                     try {
                       const rotated = (await trpcClient.tokens.rotate.mutate({ tokenId: token.tokenId })) as ControlApiTokenSecret
                       setTokenSecret(rotated.token)
                       setTokens(await trpcClient.tokens.list.query() as ControlApiTokenMetadata[])
                     } catch {
-                      setError('轮换 token 失败。')
+                      setTokenError('轮换 token 失败。')
                     }
                   }}
                 >
@@ -631,12 +705,12 @@ function HostsPage() {
                   type="button"
                   className="bg-slate-800 text-slate-100 hover:bg-slate-700"
                   onClick={async () => {
-                    setError(null)
+                    setTokenError(null)
                     try {
                       await trpcClient.tokens.revoke.mutate({ tokenId: token.tokenId })
                       setTokens(await trpcClient.tokens.list.query() as ControlApiTokenMetadata[])
                     } catch {
-                      setError('撤销 token 失败。')
+                      setTokenError('撤销 token 失败。')
                     }
                   }}
                 >
@@ -650,10 +724,13 @@ function HostsPage() {
       <div className="space-y-4">
         {hosts.map((host) => {
           const editableServices = hostEditors[host.hostId] ?? []
-          const savedServices = buildEditableServices(host)
-          const validation = validateServices(editableServices)
+          const baselineServices = buildBaselineServices(host)
+          const savedServices = baselineServices.map(toServiceDraft)
+          const validation = validateServices(stripServiceDrafts(editableServices))
           const rowErrors = validation.fieldErrors
-          const isDirty = !areServicesEqual(editableServices, savedServices)
+          const isDirty = !areServicesEqual(editableServices, baselineServices)
+          const isSavingHost = Boolean(savingHostIds[host.hostId])
+          const isImportingHost = Boolean(importingHostIds[host.hostId])
           const hostNotice = hostNotices[host.hostId] ?? null
           const importDraft = importDrafts[host.hostId] ?? ''
           const serviceSummaries = reachabilitySummaries.filter((summary) => summary.hostId === host.hostId)
@@ -738,12 +815,12 @@ function HostsPage() {
                   <Button
                     type="button"
                     className="bg-slate-800 text-slate-100 hover:bg-slate-700"
-                    disabled={!isDirty || savingHostId === host.hostId}
+                    disabled={!isDirty || isSavingHost}
                     onClick={() => {
                       setHostNotices((current) => ({ ...current, [host.hostId]: null }))
                       setHostEditors((current) => ({
                         ...current,
-                        [host.hostId]: cloneServices(savedServices),
+                        [host.hostId]: cloneServiceDrafts(savedServices),
                       }))
                     }}
                   >
@@ -751,7 +828,7 @@ function HostsPage() {
                   </Button>
                   <Button
                     type="button"
-                    disabled={savingHostId === host.hostId || !isDirty || validation.hasErrors}
+                    disabled={isSavingHost || !isDirty || validation.hasErrors}
                     onClick={async () => {
                       if (validation.hasErrors) {
                         setHostNotices((current) => ({
@@ -761,15 +838,15 @@ function HostsPage() {
                         return
                       }
 
-                      const normalizedServices = normalizeServices(editableServices)
-                      setSavingHostId(host.hostId)
+                      const normalizedServices = normalizeServices(stripServiceDrafts(editableServices))
+                      setSavingHostIds((current) => ({ ...current, [host.hostId]: true }))
                       setHostNotices((current) => ({ ...current, [host.hostId]: null }))
                       try {
                         await trpcClient.hosts.upsertDesired.mutate({
                           hostId: host.hostId,
                           services: normalizedServices,
                         })
-                        await reloadHosts()
+                        await reloadHosts([host.hostId])
                         setHostNotices((current) => ({
                           ...current,
                           [host.hostId]: { tone: 'success', text: 'desired services 已保存。' },
@@ -780,11 +857,11 @@ function HostsPage() {
                           [host.hostId]: { tone: 'error', text: '保存 desired services 失败。' },
                         }))
                       } finally {
-                        setSavingHostId(null)
+                        setSavingHostIds((current) => ({ ...current, [host.hostId]: false }))
                       }
                     }}
                   >
-                    {savingHostId === host.hostId ? '保存中...' : '保存 desired'}
+                    {isSavingHost ? '保存中...' : '保存 desired'}
                   </Button>
                 </div>
               </div>
@@ -803,7 +880,7 @@ function HostsPage() {
                 {editableServices.length > 0 ? editableServices.map((service, index) => {
                   const rowError = rowErrors[index] ?? {}
                   return (
-                  <div key={`${host.hostId}-${service.serviceId}-${index}`} className="space-y-2 rounded-md border border-slate-800 p-3">
+                  <div key={service.rowId} className="space-y-2 rounded-md border border-slate-800 p-3">
                     <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-[1fr_1fr_1.2fr_140px_1fr_auto]">
                       <div className="space-y-1">
                         <Input
@@ -910,9 +987,9 @@ function HostsPage() {
                 <div className="flex justify-end">
                   <Button
                     type="button"
-                    disabled={importingHostId === host.hostId || importDraft.length === 0}
+                    disabled={isImportingHost || importDraft.length === 0}
                     onClick={async () => {
-                      setImportingHostId(host.hostId)
+                      setImportingHostIds((current) => ({ ...current, [host.hostId]: true }))
                       setHostNotices((current) => ({ ...current, [host.hostId]: null }))
                       try {
                         const parsed = JSON.parse(importDraft) as { services?: ControlPlaneService[] }
@@ -930,7 +1007,7 @@ function HostsPage() {
                           hostId: host.hostId,
                           services: normalizedServices,
                         })
-                        await reloadHosts()
+                        await reloadHosts([host.hostId])
                         setImportDrafts((current) => ({ ...current, [host.hostId]: '' }))
                         setHostNotices((current) => ({
                           ...current,
@@ -942,11 +1019,11 @@ function HostsPage() {
                           [host.hostId]: { tone: 'error', text: '导入 static config 失败。' },
                         }))
                       } finally {
-                        setImportingHostId(null)
+                        setImportingHostIds((current) => ({ ...current, [host.hostId]: false }))
                       }
                     }}
                   >
-                    {importingHostId === host.hostId ? '导入中...' : '导入到该 Host'}
+                    {isImportingHost ? '导入中...' : '导入到该 Host'}
                   </Button>
                 </div>
               </div>

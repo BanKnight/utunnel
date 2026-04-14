@@ -4,6 +4,12 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-04-11",
   "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "head_sampling_rate": 1
+    }
+  },
   "vars": {
     "ROOT_DOMAIN": "example.test",
     "OPERATOR_TOKEN": "dev-operator-token",
@@ -29,6 +35,11 @@
       }
     ]
   },
+  "tail_consumers": [
+    {
+      "service": "utunnel-edge-tail"
+    }
+  ],
   "migrations": [
     {
       "tag": "v1",

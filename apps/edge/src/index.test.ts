@@ -2800,11 +2800,21 @@ describe('edge app integration', () => {
     expect(await registerHost('host-1', 'session-1', 'one.example.test')).toHaveProperty('status', 200)
     expect(await registerHost('host-2', 'session-2', 'two.example.test')).toHaveProperty('status', 200)
 
+    const now = Date.now()
+    const connectedHost = env.HOST_SESSION.get('host-1')
+    connectedHost.session = {
+      ...connectedHost.session!,
+      connectedAt: now - 200,
+      lastHeartbeatAt: now - 100,
+      disconnectedAt: null,
+    }
+
     const disconnectedHost = env.HOST_SESSION.get('host-2')
     disconnectedHost.session = {
       ...disconnectedHost.session!,
-      disconnectedAt: Date.now(),
-      lastHeartbeatAt: Date.now() - 10_000,
+      connectedAt: now - 1_500,
+      disconnectedAt: now - 50,
+      lastHeartbeatAt: now - 10_000,
     }
 
     const login = await app.request(

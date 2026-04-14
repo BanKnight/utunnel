@@ -1,0 +1,13 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "utunnel-edge-tail",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-11",
+  "compatibility_flags": ["nodejs_compat"],
+  "analytics_engine_datasets": [
+    {
+      "binding": "REACHABILITY_ANALYTICS",
+      "dataset": "utunnel_reachability"
+    }
+  ]
+}

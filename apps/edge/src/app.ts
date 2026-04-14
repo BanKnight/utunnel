@@ -67,6 +67,19 @@ type ExecutionContextLike = {
   waitUntil?: (promise: Promise<unknown>) => void
 }
 
+type ReachabilityObservationInput = {
+  hostId: string
+  serviceId: string
+  hostname: string
+  method: string
+  path: string
+  checkedAt: number
+  success: boolean
+  statusCode?: number
+  latencyMs?: number
+  failureKind?: 'status-code' | 'edge'
+}
+
 const getRoutingStub = (env: EdgeBindings) => {
   return env.ROUTING_DIRECTORY.get(env.ROUTING_DIRECTORY.idFromName('global'))
 }
@@ -75,20 +88,46 @@ const getHostStub = (env: EdgeBindings, hostId: string) => {
   return env.HOST_SESSION.get(env.HOST_SESSION.idFromName(hostId))
 }
 
+const logReachabilityObservation = (observation: ReachabilityObservationInput) => {
+  if (typeof process !== 'undefined' && process.env.NODE_ENV === 'test') {
+    return
+  }
+
+  console.log(
+    JSON.stringify({
+      kind: 'utunnel_reachability_observation',
+      ...observation,
+    }),
+  )
+}
+
 const persistReachabilityObservation = async (
   env: EdgeBindings,
-  observation: {
-    hostId: string
-    serviceId: string
-    checkedAt: number
-    success: boolean
-    statusCode?: number
-    latencyMs?: number
-    failureKind?: 'status-code' | 'edge'
-  },
+  observation: ReachabilityObservationInput,
 ) => {
+  const record = observation.success
+    ? {
+        hostId: observation.hostId,
+        serviceId: observation.serviceId,
+        checkedAt: observation.checkedAt,
+        success: true,
+        statusCode: observation.statusCode,
+        latencyMs: observation.latencyMs,
+      }
+    : {
+        hostId: observation.hostId,
+        serviceId: observation.serviceId,
+        checkedAt: observation.checkedAt,
+        success: false,
+        statusCode: observation.statusCode,
+        latencyMs: observation.latencyMs,
+        failureKind: observation.failureKind ?? 'edge',
+      }
+
+  logReachabilityObservation(observation)
+
   try {
-    await getRoutingStub(env).fetch(toJsonRequest('https://routing.internal/control/probes/record', observation))
+    await getRoutingStub(env).fetch(toJsonRequest('https://routing.internal/control/probes/record', record))
   } catch (error) {
     console.error('reachability_observation_persist_failed', {
       hostId: observation.hostId,
@@ -362,6 +401,9 @@ export const handleTunnelRequest = async (
       ? persistReachabilityObservation(env, {
           hostId: route.hostId,
           serviceId: route.serviceId,
+          hostname,
+          method: request.method,
+          path: relayPath,
           checkedAt,
           success: true,
           statusCode,
@@ -370,6 +412,9 @@ export const handleTunnelRequest = async (
       : persistReachabilityObservation(env, {
           hostId: route.hostId,
           serviceId: route.serviceId,
+          hostname,
+          method: request.method,
+          path: relayPath,
           checkedAt,
           success: false,
           statusCode,
@@ -385,6 +430,9 @@ export const handleTunnelRequest = async (
       persistReachabilityObservation(env, {
         hostId: route.hostId,
         serviceId: route.serviceId,
+        hostname,
+        method: request.method,
+        path: relayPath,
         checkedAt,
         success: false,
         latencyMs: checkedAt - startedAt,
