@@ -806,7 +806,7 @@ describe('edge app integration', () => {
     expect(revokedDenied.status).toBe(401)
   })
 
-  test('shares desired validation and dispatch between REST and tRPC import', async () => {
+  test('shares desired validation between REST and tRPC static config import preview', async () => {
     const env = {
       ...createEnv(),
       UI_PASSWORD: 'console-password',
@@ -867,16 +867,24 @@ describe('edge app integration', () => {
       hostId: 'host-import',
       services: [
         {
-          serviceId: 'svc-good',
-          serviceName: 'good',
+          serviceId: ' svc-good ',
+          serviceName: ' good ',
           localUrl: 'http://127.0.0.1:3001',
           protocol: 'http',
-          subdomain: 'good.example.test',
+          subdomain: 'GOOD.EXAMPLE.TEST:443',
         },
       ],
     })
 
-    expect(imported.generation).toBe(1)
+    expect(imported.services).toEqual([
+      {
+        serviceId: ' svc-good ',
+        serviceName: ' good ',
+        localUrl: 'http://127.0.0.1:3001',
+        protocol: 'http',
+        subdomain: 'good.example.test',
+      },
+    ])
 
     const desired = await app.request(
       'http://edge.test/api/control/hosts',
@@ -884,12 +892,9 @@ describe('edge app integration', () => {
       env,
     )
     const desiredJson = (await desired.json()) as HostControlState[]
-    expect(desiredJson[0]?.desired?.services[0]?.subdomain).toBe('good.example.test')
-
-    const hostStub = env.HOST_SESSION.get('host-import') as unknown as { fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> }
-    const dispatchResponse = await hostStub.fetch('https://host.internal/control/dispatch', { method: 'POST' })
-    expect(dispatchResponse.status).toBe(200)
+    expect(desiredJson).toHaveLength(0)
   })
+
 
   test('supports control shell tRPC login, me, summary, and logout flow', async () => {
     const env = {
@@ -1390,6 +1395,612 @@ describe('edge app integration', () => {
     const trpcSummaries = await client.services.reachability.query()
     expect(trpcSummaries[0]?.serviceId).toBe('svc-reachability')
     expect(trpcSummaries[0]?.recentResults).toHaveLength(2)
+  })
+
+  test('returns service reachability summaries from analytics engine when configured', async () => {
+    const env = {
+      ...createEnv(),
+      REACHABILITY_ANALYTICS_ACCOUNT_ID: 'account-123',
+      REACHABILITY_ANALYTICS_API_TOKEN: 'token-123',
+      REACHABILITY_ANALYTICS_DATASET: 'utunnel_reachability',
+    }
+    const operatorHeader = {
+      authorization: 'Bearer dev-operator-token',
+      'content-type': 'application/json',
+    }
+
+    const services = [
+      {
+        serviceId: 'svc-ae',
+        serviceName: 'analytics-service',
+        localUrl: 'http://127.0.0.1:3304',
+        protocol: 'http' as const,
+        subdomain: 'ae.example.test',
+      },
+    ]
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-ae/desired',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ services }),
+      },
+      env,
+    )
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-ae/current',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({
+          generation: 1,
+          status: 'acknowledged',
+          services,
+        }),
+      },
+      env,
+    )
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-ae/applied',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ generation: 1, services }),
+      },
+      env,
+    )
+
+    const originalFetch = globalThis.fetch
+    let sqlRequestCount = 0
+
+    const mockedFetch = Object.assign(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = input instanceof Request ? input : new Request(input, init)
+        const url = new URL(request.url)
+
+        if (url.hostname === 'api.cloudflare.com' && url.pathname === '/client/v4/accounts/account-123/analytics_engine/sql') {
+          sqlRequestCount += 1
+          expect(request.method).toBe('POST')
+          expect(request.headers.get('authorization')).toBe('Bearer token-123')
+
+          const sql = await request.text()
+          expect(sql).toContain('FROM utunnel_reachability')
+          expect(sql).toContain("blob1 = 'host-ae'")
+          expect(sql).toContain("index1 = 'svc-ae'")
+
+          return Response.json({
+            meta: { rows: 2 },
+            rows: [
+              {
+                hostId: 'host-ae',
+                serviceId: 'svc-ae',
+                checkedAt: 2000,
+                statusCode: 503,
+                latencyMs: 45,
+                successState: 'fail',
+                failureKind: 'status-code',
+              },
+              {
+                hostId: 'host-ae',
+                serviceId: 'svc-ae',
+                checkedAt: 1500,
+                statusCode: 200,
+                latencyMs: 20,
+                successState: 'ok',
+                failureKind: 'none',
+              },
+            ],
+          })
+        }
+
+        throw new Error(`unexpected fetch: ${url.toString()}`)
+      },
+      { preconnect: originalFetch.preconnect },
+    ) as typeof fetch
+
+    globalThis.fetch = mockedFetch
+
+    try {
+      const response = await app.request(
+        'http://edge.test/api/control/services/reachability',
+        { headers: operatorHeader },
+        env,
+      )
+      const summaries = (await response.json()) as Array<{
+        hostId: string
+        serviceId: string
+        reachability: string
+        checkedAt: number | null
+        lastSuccessAt: number | null
+        lastFailureAt: number | null
+        recentResults: Array<{ checkedAt: number; success: boolean; statusCode?: number; latencyMs?: number; failureKind?: string }>
+        hasProjectedRoute: boolean
+        appliedGeneration: number | null
+      }>
+
+      expect(response.status).toBe(200)
+      expect(sqlRequestCount).toBe(1)
+      expect(summaries[0]?.hostId).toBe('host-ae')
+      expect(summaries[0]?.serviceId).toBe('svc-ae')
+      expect(summaries[0]?.reachability).toBe('degraded')
+      expect(summaries[0]?.checkedAt).toBe(2000)
+      expect(summaries[0]?.lastSuccessAt).toBe(1500)
+      expect(summaries[0]?.lastFailureAt).toBe(2000)
+      expect(summaries[0]?.recentResults).toHaveLength(2)
+      expect(summaries[0]?.recentResults[0]).toEqual({
+        checkedAt: 2000,
+        success: false,
+        statusCode: 503,
+        latencyMs: 45,
+        failureKind: 'status-code',
+      })
+      expect(summaries[0]?.hasProjectedRoute).toBe(true)
+      expect(summaries[0]?.appliedGeneration).toBe(1)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  test('falls back to DO reachability summaries when analytics dataset is missing', async () => {
+    const env = {
+      ...createEnv(),
+      REACHABILITY_ANALYTICS_ACCOUNT_ID: 'account-123',
+      REACHABILITY_ANALYTICS_API_TOKEN: 'token-123',
+    }
+    const operatorHeader = {
+      authorization: 'Bearer dev-operator-token',
+      'content-type': 'application/json',
+    }
+
+    const services = [
+      {
+        serviceId: 'svc-partial-config',
+        serviceName: 'partial-config-service',
+        localUrl: 'http://127.0.0.1:3305',
+        protocol: 'http' as const,
+        subdomain: 'partial-config.example.test',
+      },
+    ]
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-partial-config/desired',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ services }),
+      },
+      env,
+    )
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-partial-config/current',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ generation: 1, status: 'acknowledged', services }),
+      },
+      env,
+    )
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-partial-config/applied',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ generation: 1, services }),
+      },
+      env,
+    )
+
+    const originalFetch = globalThis.fetch
+    let sqlRequestCount = 0
+    const mockedFetch = Object.assign(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = input instanceof Request ? input : new Request(input, init)
+        const url = new URL(request.url)
+        if (url.hostname === 'api.cloudflare.com') {
+          sqlRequestCount += 1
+          throw new Error('analytics engine should not be called when dataset is missing')
+        }
+        return originalFetch(input, init)
+      },
+      { preconnect: originalFetch.preconnect },
+    ) as typeof fetch
+
+    globalThis.fetch = mockedFetch
+
+    try {
+      const response = await app.request(
+        'http://edge.test/api/control/services/reachability',
+        { headers: operatorHeader },
+        env,
+      )
+      const summaries = (await response.json()) as Array<{
+        serviceId: string
+        reachability: string
+        recentResults: Array<{ success: boolean; failureKind?: string }>
+      }>
+
+      expect(response.status).toBe(200)
+      expect(sqlRequestCount).toBe(0)
+      expect(summaries[0]?.serviceId).toBe('svc-partial-config')
+      expect(summaries[0]?.reachability).toBe('reachable')
+      expect(summaries[0]?.recentResults).toHaveLength(2)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  test('falls back to DO reachability summaries when analytics query fails', async () => {
+    const env = {
+      ...createEnv(),
+      REACHABILITY_ANALYTICS_ACCOUNT_ID: 'account-123',
+      REACHABILITY_ANALYTICS_API_TOKEN: 'token-123',
+      REACHABILITY_ANALYTICS_DATASET: 'utunnel_reachability',
+    }
+    const operatorHeader = {
+      authorization: 'Bearer dev-operator-token',
+      'content-type': 'application/json',
+    }
+
+    const services = [
+      {
+        serviceId: 'svc-ae-fallback',
+        serviceName: 'ae-fallback-service',
+        localUrl: 'http://127.0.0.1:3306',
+        protocol: 'http' as const,
+        subdomain: 'ae-fallback.example.test',
+      },
+    ]
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-ae-fallback/desired',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ services }),
+      },
+      env,
+    )
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-ae-fallback/current',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ generation: 1, status: 'acknowledged', services }),
+      },
+      env,
+    )
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-ae-fallback/applied',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ generation: 1, services }),
+      },
+      env,
+    )
+
+    const originalFetch = globalThis.fetch
+    let sqlRequestCount = 0
+    const mockedFetch = Object.assign(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = input instanceof Request ? input : new Request(input, init)
+        const url = new URL(request.url)
+        if (url.hostname === 'api.cloudflare.com' && url.pathname === '/client/v4/accounts/account-123/analytics_engine/sql') {
+          sqlRequestCount += 1
+          return new Response('boom', { status: 503 })
+        }
+        return originalFetch(input, init)
+      },
+      { preconnect: originalFetch.preconnect },
+    ) as typeof fetch
+
+    globalThis.fetch = mockedFetch
+
+    try {
+      const response = await app.request(
+        'http://edge.test/api/control/services/reachability',
+        { headers: operatorHeader },
+        env,
+      )
+      const summaries = (await response.json()) as Array<{
+        serviceId: string
+        reachability: string
+        recentResults: Array<{ success: boolean; failureKind?: string }>
+      }>
+
+      expect(response.status).toBe(200)
+      expect(sqlRequestCount).toBe(1)
+      expect(summaries[0]?.serviceId).toBe('svc-ae-fallback')
+      expect(summaries[0]?.reachability).toBe('reachable')
+      expect(summaries[0]?.recentResults).toHaveLength(2)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  test('escapes quoted identifiers in analytics SQL query', async () => {
+    const env = {
+      ...createEnv(),
+      REACHABILITY_ANALYTICS_ACCOUNT_ID: 'account-123',
+      REACHABILITY_ANALYTICS_API_TOKEN: 'token-123',
+      REACHABILITY_ANALYTICS_DATASET: 'utunnel_reachability',
+    }
+    const operatorHeader = {
+      authorization: 'Bearer dev-operator-token',
+      'content-type': 'application/json',
+    }
+
+    const hostId = "host'ae"
+    const services = [
+      {
+        serviceId: "svc'ae",
+        serviceName: 'quoted-service',
+        localUrl: 'http://127.0.0.1:3307',
+        protocol: 'http' as const,
+        subdomain: 'quoted.example.test',
+      },
+    ]
+
+    await app.request(
+      `http://edge.test/api/control/hosts/${encodeURIComponent(hostId)}/desired`,
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ services }),
+      },
+      env,
+    )
+
+    await app.request(
+      `http://edge.test/api/control/hosts/${encodeURIComponent(hostId)}/current`,
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ generation: 1, status: 'acknowledged', services }),
+      },
+      env,
+    )
+
+    await app.request(
+      `http://edge.test/api/control/hosts/${encodeURIComponent(hostId)}/applied`,
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ generation: 1, services }),
+      },
+      env,
+    )
+
+    const originalFetch = globalThis.fetch
+    let capturedSql = ''
+    const mockedFetch = Object.assign(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = input instanceof Request ? input : new Request(input, init)
+        const url = new URL(request.url)
+        if (url.hostname === 'api.cloudflare.com' && url.pathname === '/client/v4/accounts/account-123/analytics_engine/sql') {
+          capturedSql = await request.text()
+          return Response.json({ rows: [] })
+        }
+        return originalFetch(input, init)
+      },
+      { preconnect: originalFetch.preconnect },
+    ) as typeof fetch
+
+    globalThis.fetch = mockedFetch
+
+    try {
+      const response = await app.request(
+        'http://edge.test/api/control/services/reachability',
+        { headers: operatorHeader },
+        env,
+      )
+
+      expect(response.status).toBe(200)
+      expect(capturedSql).toContain("blob1 = 'host''ae'")
+      expect(capturedSql).toContain("index1 = 'svc''ae'")
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  test('falls back to DO reachability summaries when analytics response shape is invalid', async () => {
+    const env = {
+      ...createEnv(),
+      REACHABILITY_ANALYTICS_ACCOUNT_ID: 'account-123',
+      REACHABILITY_ANALYTICS_API_TOKEN: 'token-123',
+      REACHABILITY_ANALYTICS_DATASET: 'utunnel_reachability',
+    }
+    const operatorHeader = {
+      authorization: 'Bearer dev-operator-token',
+      'content-type': 'application/json',
+    }
+
+    const services = [
+      {
+        serviceId: 'svc-ae-invalid-shape',
+        serviceName: 'ae-invalid-shape-service',
+        localUrl: 'http://127.0.0.1:3308',
+        protocol: 'http' as const,
+        subdomain: 'ae-invalid-shape.example.test',
+      },
+    ]
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-ae-invalid-shape/desired',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ services }),
+      },
+      env,
+    )
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-ae-invalid-shape/current',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ generation: 1, status: 'acknowledged', services }),
+      },
+      env,
+    )
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-ae-invalid-shape/applied',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ generation: 1, services }),
+      },
+      env,
+    )
+
+    const originalFetch = globalThis.fetch
+    let sqlRequestCount = 0
+    const mockedFetch = Object.assign(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = input instanceof Request ? input : new Request(input, init)
+        const url = new URL(request.url)
+        if (url.hostname === 'api.cloudflare.com' && url.pathname === '/client/v4/accounts/account-123/analytics_engine/sql') {
+          sqlRequestCount += 1
+          return Response.json({ meta: { rows: 1 } })
+        }
+        return originalFetch(input, init)
+      },
+      { preconnect: originalFetch.preconnect },
+    ) as typeof fetch
+
+    globalThis.fetch = mockedFetch
+
+    try {
+      const response = await app.request(
+        'http://edge.test/api/control/services/reachability',
+        { headers: operatorHeader },
+        env,
+      )
+      const summaries = (await response.json()) as Array<{
+        serviceId: string
+        reachability: string
+        recentResults: Array<{ success: boolean; failureKind?: string }>
+      }>
+
+      expect(response.status).toBe(200)
+      expect(sqlRequestCount).toBe(1)
+      expect(summaries[0]?.serviceId).toBe('svc-ae-invalid-shape')
+      expect(summaries[0]?.reachability).toBe('reachable')
+      expect(summaries[0]?.recentResults).toHaveLength(2)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  test('falls back to DO reachability summaries when analytics rows are malformed', async () => {
+    const env = {
+      ...createEnv(),
+      REACHABILITY_ANALYTICS_ACCOUNT_ID: 'account-123',
+      REACHABILITY_ANALYTICS_API_TOKEN: 'token-123',
+      REACHABILITY_ANALYTICS_DATASET: 'utunnel_reachability',
+    }
+    const operatorHeader = {
+      authorization: 'Bearer dev-operator-token',
+      'content-type': 'application/json',
+    }
+
+    const services = [
+      {
+        serviceId: 'svc-ae-invalid-row',
+        serviceName: 'ae-invalid-row-service',
+        localUrl: 'http://127.0.0.1:3309',
+        protocol: 'http' as const,
+        subdomain: 'ae-invalid-row.example.test',
+      },
+    ]
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-ae-invalid-row/desired',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ services }),
+      },
+      env,
+    )
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-ae-invalid-row/current',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ generation: 1, status: 'acknowledged', services }),
+      },
+      env,
+    )
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-ae-invalid-row/applied',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ generation: 1, services }),
+      },
+      env,
+    )
+
+    const originalFetch = globalThis.fetch
+    let sqlRequestCount = 0
+    const mockedFetch = Object.assign(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = input instanceof Request ? input : new Request(input, init)
+        const url = new URL(request.url)
+        if (url.hostname === 'api.cloudflare.com' && url.pathname === '/client/v4/accounts/account-123/analytics_engine/sql') {
+          sqlRequestCount += 1
+          return Response.json({
+            rows: [
+              {
+                hostId: 'host-ae-invalid-row',
+                serviceId: 'svc-ae-invalid-row',
+                checkedAt: 'not-a-number',
+                statusCode: 200,
+                latencyMs: 20,
+                successState: 'ok',
+              },
+            ],
+          })
+        }
+        return originalFetch(input, init)
+      },
+      { preconnect: originalFetch.preconnect },
+    ) as typeof fetch
+
+    globalThis.fetch = mockedFetch
+
+    try {
+      const response = await app.request(
+        'http://edge.test/api/control/services/reachability',
+        { headers: operatorHeader },
+        env,
+      )
+      const summaries = (await response.json()) as Array<{
+        serviceId: string
+        reachability: string
+        recentResults: Array<{ success: boolean; failureKind?: string }>
+      }>
+
+      expect(response.status).toBe(200)
+      expect(sqlRequestCount).toBe(1)
+      expect(summaries[0]?.serviceId).toBe('svc-ae-invalid-row')
+      expect(summaries[0]?.reachability).toBe('reachable')
+      expect(summaries[0]?.recentResults).toHaveLength(2)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
   })
 
   test('rejects unauthorized host mutations', async () => {

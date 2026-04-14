@@ -15,6 +15,9 @@ export type EdgeBindings = {
   UI_PASSWORD?: string
   SESSION_SECRET?: string
   SESSION_TTL_MS?: string
+  REACHABILITY_ANALYTICS_ACCOUNT_ID?: string
+  REACHABILITY_ANALYTICS_API_TOKEN?: string
+  REACHABILITY_ANALYTICS_DATASET?: string
   ASSETS?: FetchStub
   ROUTING_DIRECTORY: NamespaceLike<FetchStub>
   HOST_SESSION: NamespaceLike<FetchStub>

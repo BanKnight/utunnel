@@ -14,6 +14,7 @@ import {
   listControlPlaneHosts,
   listServiceReachabilitySummaries,
   issueHostBootstrap,
+  normalizeAndValidateDesiredServices,
   revokeControlApiToken,
   rotateControlApiToken,
 } from './control-plane'
@@ -120,11 +121,16 @@ export const appRouter = t.router({
         }),
       )
       .mutation(async ({ ctx, input }) => {
-        const result = await applyDesiredHostServices(ctx.env, input.hostId, input.services)
-        if (!result.ok) {
-          throw new TRPCError({ code: 'BAD_REQUEST', message: result.reason })
+        try {
+          return {
+            services: normalizeAndValidateDesiredServices(ctx.env, input.services),
+          }
+        } catch (error) {
+          throw new TRPCError({
+            code: 'BAD_REQUEST',
+            message: error instanceof Error ? error.message : 'invalid_static_config',
+          })
         }
-        return result.value
       }),
   }),
   services: t.router({

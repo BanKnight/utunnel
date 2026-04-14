@@ -570,6 +570,7 @@ function HostsPage() {
   const [creatingToken, setCreatingToken] = useState(false)
   const [reachabilitySummaries, setReachabilitySummaries] = useState<ControlPlaneServiceReachabilitySummary[]>([])
   const [importingHostIds, setImportingHostIds] = useState<Record<string, boolean>>({})
+  const [importOpenHostIds, setImportOpenHostIds] = useState<Record<string, boolean>>({})
 
   const reloadHosts = async (syncHostIds: string[] = []) => {
     const previousHosts = hostsRef.current
@@ -731,6 +732,7 @@ function HostsPage() {
           const isDirty = !areServicesEqual(editableServices, baselineServices)
           const isSavingHost = Boolean(savingHostIds[host.hostId])
           const isImportingHost = Boolean(importingHostIds[host.hostId])
+          const isImportOpen = Boolean(importOpenHostIds[host.hostId])
           const hostNotice = hostNotices[host.hostId] ?? null
           const importDraft = importDrafts[host.hostId] ?? ''
           const serviceSummaries = reachabilitySummaries.filter((summary) => summary.hostId === host.hostId)
@@ -811,6 +813,19 @@ function HostsPage() {
                     }}
                   >
                     新增 service
+                  </Button>
+                  <Button
+                    type="button"
+                    className="bg-slate-800 text-slate-100 hover:bg-slate-700"
+                    onClick={() => {
+                      setHostNotices((current) => ({ ...current, [host.hostId]: null }))
+                      setImportOpenHostIds((current) => ({
+                        ...current,
+                        [host.hostId]: !current[host.hostId],
+                      }))
+                    }}
+                  >
+                    {isImportOpen ? '收起导入' : '导入 static config'}
                   </Button>
                   <Button
                     type="button"
@@ -970,63 +985,71 @@ function HostsPage() {
                   </div>
                 )}) : <p className="text-sm text-slate-500">暂无 desired services，可直接新增。</p>}
               </div>
-              <div className="rounded-md border border-dashed border-slate-800 p-4 space-y-3">
-                <div>
-                  <p className="text-sm font-medium text-slate-200">导入 static config</p>
-                  <p className="text-sm text-slate-500">把旧静态配置导入到当前 host 的 desired.services。</p>
-                </div>
-                <textarea
-                  className="min-h-32 w-full rounded-md border border-slate-800 bg-slate-950 p-3 text-sm text-slate-100"
-                  placeholder='{"services":[...]}'
-                  value={importDraft}
-                  onChange={(event) => {
-                    const value = event.target.value
-                    setImportDrafts((current) => ({ ...current, [host.hostId]: value }))
-                  }}
-                />
-                <div className="flex justify-end">
-                  <Button
-                    type="button"
-                    disabled={isImportingHost || importDraft.length === 0}
-                    onClick={async () => {
-                      setImportingHostIds((current) => ({ ...current, [host.hostId]: true }))
-                      setHostNotices((current) => ({ ...current, [host.hostId]: null }))
-                      try {
-                        const parsed = JSON.parse(importDraft) as { services?: ControlPlaneService[] }
-                        const normalizedServices = normalizeServices(parsed.services ?? [])
-                        const importValidation = validateServices(normalizedServices)
-                        if (importValidation.hasErrors) {
+              {isImportOpen ? (
+                <div className="rounded-md border border-dashed border-slate-800 p-4 space-y-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-medium text-slate-200">导入 static config</p>
+                      <p className="text-sm text-slate-500">把旧静态配置导入到当前 host 的编辑草稿，确认后再保存 desired。</p>
+                    </div>
+                    <Button
+                      type="button"
+                      className="bg-slate-800 text-slate-100 hover:bg-slate-700"
+                      onClick={() => {
+                        setImportOpenHostIds((current) => ({ ...current, [host.hostId]: false }))
+                      }}
+                    >
+                      取消
+                    </Button>
+                  </div>
+                  <textarea
+                    className="min-h-32 w-full rounded-md border border-slate-800 bg-slate-950 p-3 text-sm text-slate-100"
+                    placeholder='{"services":[...]}'
+                    value={importDraft}
+                    onChange={(event) => {
+                      const value = event.target.value
+                      setImportDrafts((current) => ({ ...current, [host.hostId]: value }))
+                    }}
+                  />
+                  <div className="flex justify-end">
+                    <Button
+                      type="button"
+                      disabled={isImportingHost || importDraft.length === 0}
+                      onClick={async () => {
+                        setImportingHostIds((current) => ({ ...current, [host.hostId]: true }))
+                        setHostNotices((current) => ({ ...current, [host.hostId]: null }))
+                        try {
+                          const parsed = JSON.parse(importDraft) as { services?: ControlPlaneService[] } | ControlPlaneService[]
+                          const importedServices = Array.isArray(parsed) ? parsed : (parsed.services ?? [])
+                          const result = (await trpcClient.hosts.importStaticConfig.mutate({
+                            hostId: host.hostId,
+                            services: importedServices,
+                          })) as { services: ControlPlaneService[] }
+                          setHostEditors((current) => ({
+                            ...current,
+                            [host.hostId]: result.services.map(toServiceDraft),
+                          }))
+                          setImportDrafts((current) => ({ ...current, [host.hostId]: '' }))
+                          setImportOpenHostIds((current) => ({ ...current, [host.hostId]: false }))
                           setHostNotices((current) => ({
                             ...current,
-                            [host.hostId]: { tone: 'error', text: '导入内容包含无效 service 字段，请先修正后再导入。' },
+                            [host.hostId]: { tone: 'success', text: 'static config 已导入到草稿，请确认后保存。' },
                           }))
-                          return
+                        } catch {
+                          setHostNotices((current) => ({
+                            ...current,
+                            [host.hostId]: { tone: 'error', text: '导入 static config 失败。' },
+                          }))
+                        } finally {
+                          setImportingHostIds((current) => ({ ...current, [host.hostId]: false }))
                         }
-
-                        await trpcClient.hosts.importStaticConfig.mutate({
-                          hostId: host.hostId,
-                          services: normalizedServices,
-                        })
-                        await reloadHosts([host.hostId])
-                        setImportDrafts((current) => ({ ...current, [host.hostId]: '' }))
-                        setHostNotices((current) => ({
-                          ...current,
-                          [host.hostId]: { tone: 'success', text: 'static config 已导入。' },
-                        }))
-                      } catch {
-                        setHostNotices((current) => ({
-                          ...current,
-                          [host.hostId]: { tone: 'error', text: '导入 static config 失败。' },
-                        }))
-                      } finally {
-                        setImportingHostIds((current) => ({ ...current, [host.hostId]: false }))
-                      }
-                    }}
-                  >
-                    {isImportingHost ? '导入中...' : '导入到该 Host'}
-                  </Button>
+                      }}
+                    >
+                      {isImportingHost ? '导入中...' : '导入到草稿'}
+                    </Button>
+                  </div>
                 </div>
-              </div>
+              ) : null}
             </div>
             <div className="grid gap-3 md:grid-cols-3">
               <StateColumn

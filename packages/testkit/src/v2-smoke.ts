@@ -250,9 +250,14 @@ const main = async () => {
         }
       }, 90_000, 'agent_claimed_and_connected')
 
-      await trpc.hosts.importStaticConfig.mutate({
+      const imported = await trpc.hosts.importStaticConfig.mutate({
         hostId: demoConfig.hostId,
         services: demoConfig.services,
+      })
+
+      await trpc.hosts.upsertDesired.mutate({
+        hostId: demoConfig.hostId,
+        services: imported.services,
       })
 
       await waitFor(async () => {

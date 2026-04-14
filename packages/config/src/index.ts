@@ -9,6 +9,9 @@ export const edgeEnvSchema = z.object({
   UI_PASSWORD: z.string().min(1).optional(),
   SESSION_SECRET: z.string().min(1).optional(),
   SESSION_TTL_MS: z.coerce.number().int().positive().optional(),
+  REACHABILITY_ANALYTICS_ACCOUNT_ID: z.string().min(1).optional(),
+  REACHABILITY_ANALYTICS_API_TOKEN: z.string().min(1).optional(),
+  REACHABILITY_ANALYTICS_DATASET: z.string().min(1).optional(),
 })
 
 export const agentConfigSchema = z

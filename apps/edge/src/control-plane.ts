@@ -6,12 +6,14 @@ import type {
   HostSessionRecord,
   RoutingEntry,
   ServiceDefinition,
+  ServiceProbeRecord,
   ServiceProbeResult,
   ServiceReachability,
 } from '@utunnel/protocol'
 import { configDispatchMessageSchema, serviceDefinitionSchema } from '@utunnel/protocol'
 import { z } from 'zod'
 import { isHostnameInRootDomain, isSessionHealthy, normalizeServiceDefinitions } from './lib'
+import { deriveServiceReachability } from './reachability'
 import type { EdgeBindings, FetchStub } from './types'
 
 export type AppliedRouteProjection = {
@@ -204,7 +206,7 @@ const buildBootstrapCommand = (input: {
   ].join('\n')
 }
 
-const normalizeAndValidateDesiredServices = (env: EdgeBindings, servicesInput: unknown) => {
+export const normalizeAndValidateDesiredServices = (env: EdgeBindings, servicesInput: unknown) => {
   const services = z.array(serviceDefinitionSchema).parse(servicesInput)
   const normalizedServices = normalizeServiceDefinitions(services)
 
@@ -215,6 +217,272 @@ const normalizeAndValidateDesiredServices = (env: EdgeBindings, servicesInput: u
   }
 
   return normalizedServices
+}
+
+type ServiceReachabilitySummaryBase = Pick<
+  ControlPlaneServiceReachabilitySummary,
+  | 'hostId'
+  | 'serviceId'
+  | 'serviceName'
+  | 'subdomain'
+  | 'protocol'
+  | 'reachability'
+  | 'checkedAt'
+  | 'lastSuccessAt'
+  | 'lastFailureAt'
+  | 'recentResults'
+>
+
+type ReachabilityServiceTarget = {
+  hostId: string
+  service: ServiceDefinition
+}
+
+type ReachabilityAnalyticsConfig = {
+  accountId: string
+  apiToken: string
+  dataset: string
+}
+
+type ReachabilityAnalyticsRow = {
+  hostId?: unknown
+  serviceId?: unknown
+  checkedAt?: unknown
+  statusCode?: unknown
+  latencyMs?: unknown
+  successState?: unknown
+  failureKind?: unknown
+}
+
+const REACHABILITY_ANALYTICS_RECENT_RESULTS_LIMIT = 5
+
+const getReachabilityAnalyticsConfig = (
+  edgeEnv: ReturnType<typeof parseEdgeEnv>,
+): ReachabilityAnalyticsConfig | null => {
+  if (
+    !edgeEnv.REACHABILITY_ANALYTICS_ACCOUNT_ID ||
+    !edgeEnv.REACHABILITY_ANALYTICS_API_TOKEN ||
+    !edgeEnv.REACHABILITY_ANALYTICS_DATASET
+  ) {
+    return null
+  }
+
+  return {
+    accountId: edgeEnv.REACHABILITY_ANALYTICS_ACCOUNT_ID,
+    apiToken: edgeEnv.REACHABILITY_ANALYTICS_API_TOKEN,
+    dataset: edgeEnv.REACHABILITY_ANALYTICS_DATASET,
+  }
+}
+
+const toSqlIdentifier = (value: string) => {
+  if (!/^[A-Za-z0-9_]+$/.test(value)) {
+    throw new Error('invalid_reachability_analytics_dataset')
+  }
+
+  return value
+}
+
+const toSqlStringLiteral = (value: string) => {
+  return `'${value.replaceAll("'", "''")}'`
+}
+
+const toOptionalNumber = (value: unknown) => {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value
+  }
+
+  if (typeof value === 'string' && value.length > 0) {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) {
+      return parsed
+    }
+  }
+
+  return undefined
+}
+
+const toOptionalStatusCode = (value: unknown) => {
+  const parsed = toOptionalNumber(value)
+  if (parsed === undefined || !Number.isInteger(parsed) || parsed < 100 || parsed > 599) {
+    return undefined
+  }
+
+  return parsed
+}
+
+const toOptionalFailureKind = (value: unknown): ServiceProbeRecord['failureKind'] => {
+  switch (value) {
+    case 'timeout':
+    case 'dns':
+    case 'edge':
+    case 'upstream':
+    case 'status-code':
+    case 'unknown':
+      return value
+    default:
+      return undefined
+  }
+}
+
+const queryReachabilityAnalyticsEngine = async <Row>(config: ReachabilityAnalyticsConfig, sql: string): Promise<Row[]> => {
+  const response = await fetch(
+    `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(config.accountId)}/analytics_engine/sql`,
+    {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${config.apiToken}`,
+        'content-type': 'text/plain',
+      },
+      body: sql,
+    },
+  )
+
+  if (!response.ok) {
+    throw new Error(`reachability_analytics_query_failed:${response.status}`)
+  }
+
+  const json = (await response.json()) as {
+    rows?: Row[]
+    data?: Row[]
+  }
+
+  if (Array.isArray(json.rows)) {
+    return json.rows
+  }
+
+  if (Array.isArray(json.data)) {
+    return json.data
+  }
+
+  throw new Error('invalid_reachability_analytics_response')
+}
+
+const buildServiceReachabilitySummaryBase = (
+  hostId: string,
+  service: ServiceDefinition,
+  recentRecords: ServiceProbeRecord[],
+): ServiceReachabilitySummaryBase => {
+  const recentResults: ServiceProbeResult[] = recentRecords.map((record) => ({
+    checkedAt: record.checkedAt,
+    success: record.success,
+    statusCode: record.statusCode,
+    latencyMs: record.latencyMs,
+    failureKind: record.failureKind,
+  }))
+  const lastSuccess = recentResults.find((result) => result.success) ?? null
+  const lastFailure = recentResults.find((result) => !result.success) ?? null
+
+  return {
+    hostId,
+    serviceId: service.serviceId,
+    serviceName: service.serviceName,
+    subdomain: service.subdomain,
+    protocol: service.protocol,
+    reachability: deriveServiceReachability(recentRecords),
+    checkedAt: recentResults[0]?.checkedAt ?? null,
+    lastSuccessAt: lastSuccess?.checkedAt ?? null,
+    lastFailureAt: lastFailure?.checkedAt ?? null,
+    recentResults,
+  }
+}
+
+const listReachabilitySummaryBasesFromRoutingDirectory = async (
+  env: EdgeBindings,
+): Promise<ServiceReachabilitySummaryBase[]> => {
+  const response = await getControlPlaneStub(env).fetch('https://routing.internal/control/services/reachability')
+  return readJson<ServiceReachabilitySummaryBase[]>(response)
+}
+
+const listReachabilitySummaryBasesFromAnalyticsEngine = async (
+  edgeEnv: ReturnType<typeof parseEdgeEnv>,
+  services: ReachabilityServiceTarget[],
+): Promise<ServiceReachabilitySummaryBase[]> => {
+  const config = getReachabilityAnalyticsConfig(edgeEnv)
+  if (!config || services.length === 0) {
+    return []
+  }
+
+  const dataset = toSqlIdentifier(config.dataset)
+  const serviceByKey = new Map<string, ServiceDefinition>(
+    services.map(({ hostId, service }) => [`${hostId}:${service.serviceId}`, service]),
+  )
+  const rows = await queryReachabilityAnalyticsEngine<ReachabilityAnalyticsRow>(
+    config,
+    [
+      'SELECT',
+      '  blob1 AS hostId,',
+      '  index1 AS serviceId,',
+      '  double3 AS checkedAt,',
+      '  double1 AS statusCode,',
+      '  double2 AS latencyMs,',
+      '  blob5 AS successState,',
+      '  blob6 AS failureKind',
+      `FROM ${dataset}`,
+      `WHERE ${services.map(({ hostId, service }) => `(blob1 = ${toSqlStringLiteral(hostId)} AND index1 = ${toSqlStringLiteral(service.serviceId)})`).join(' OR ')}`,
+      'ORDER BY double3 DESC',
+    ].join('\n'),
+  )
+
+  const recentRecordsByKey = new Map<string, ServiceProbeRecord[]>()
+  for (const row of rows) {
+    if (typeof row.hostId !== 'string' || typeof row.serviceId !== 'string') {
+      throw new Error('invalid_reachability_analytics_row_identity')
+    }
+
+    const key = `${row.hostId}:${row.serviceId}`
+    if (!serviceByKey.has(key)) {
+      continue
+    }
+
+    const existing = recentRecordsByKey.get(key) ?? []
+    if (existing.length >= REACHABILITY_ANALYTICS_RECENT_RESULTS_LIMIT) {
+      continue
+    }
+
+    const checkedAt = toOptionalNumber(row.checkedAt)
+    if (checkedAt === undefined || !Number.isInteger(checkedAt) || checkedAt < 0) {
+      throw new Error('invalid_reachability_analytics_row_checked_at')
+    }
+
+    if (row.successState !== 'ok' && row.successState !== 'fail') {
+      throw new Error('invalid_reachability_analytics_row_success_state')
+    }
+
+    const failureKind = toOptionalFailureKind(row.failureKind)
+    existing.push(
+      row.successState === 'ok'
+        ? {
+            hostId: row.hostId,
+            serviceId: row.serviceId,
+            checkedAt,
+            success: true,
+            statusCode: toOptionalStatusCode(row.statusCode),
+            latencyMs: toOptionalNumber(row.latencyMs),
+          }
+        : {
+            hostId: row.hostId,
+            serviceId: row.serviceId,
+            checkedAt,
+            success: false,
+            statusCode: toOptionalStatusCode(row.statusCode),
+            latencyMs: toOptionalNumber(row.latencyMs),
+            failureKind: failureKind ?? 'unknown',
+          },
+    )
+    recentRecordsByKey.set(key, existing)
+  }
+
+  return services
+    .map(({ hostId, service }) =>
+      buildServiceReachabilitySummaryBase(hostId, service, recentRecordsByKey.get(`${hostId}:${service.serviceId}`) ?? []),
+    )
+    .sort((left, right) => {
+      if (left.hostId !== right.hostId) {
+        return left.hostId.localeCompare(right.hostId)
+      }
+
+      return left.serviceId.localeCompare(right.serviceId)
+    })
 }
 
 export const dispatchDesiredConfigToHost = async (env: EdgeBindings, hostId: string) => {
@@ -471,21 +739,23 @@ export const listServiceReachabilitySummaries = async (
     }),
   )
   const sessionByHostId = new Map(hostSessions)
-  const response = await getControlPlaneStub(env).fetch('https://routing.internal/control/services/reachability')
-  const summaries = await readJson<
-    Array<{
-      hostId: string
-      serviceId: string
-      serviceName: string
-      subdomain: string
-      protocol: ServiceDefinition['protocol']
-      reachability: ServiceReachability
-      checkedAt: number | null
-      lastSuccessAt: number | null
-      lastFailureAt: number | null
-      recentResults: ServiceProbeResult[]
-    }>
-  >(response)
+  const serviceTargets = controlStates.flatMap((state) =>
+    (state.applied?.services ?? []).map((service) => ({ hostId: state.hostId, service })),
+  )
+
+  let summaries: ServiceReachabilitySummaryBase[]
+  if (getReachabilityAnalyticsConfig(edgeEnv)) {
+    try {
+      summaries = await listReachabilitySummaryBasesFromAnalyticsEngine(edgeEnv, serviceTargets)
+    } catch (error) {
+      console.error('reachability_analytics_read_failed', {
+        error: error instanceof Error ? error.message : 'unknown_error',
+      })
+      summaries = await listReachabilitySummaryBasesFromRoutingDirectory(env)
+    }
+  } else {
+    summaries = await listReachabilitySummaryBasesFromRoutingDirectory(env)
+  }
 
   return summaries.map((summary) => {
     const state = stateByHostId.get(summary.hostId) ?? null
