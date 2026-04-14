@@ -23,6 +23,7 @@ class FakeRoutingStub {
   private desired = new Map<string, HostControlState['desired']>()
   private current = new Map<string, HostControlState['current']>()
   private applied = new Map<string, HostControlState['applied']>()
+  private generationCounters = new Map<string, number>()
   private probeResults = new Map<string, Array<{ checkedAt: number; success: boolean; statusCode?: number; latencyMs?: number; failureKind?: string }>>()
 
   private readHostState(hostId: string): HostControlState {
@@ -264,7 +265,8 @@ class FakeRoutingStub {
 
       if (request.method === 'GET' && action === null) {
         const state = this.readHostState(hostId)
-        if (!state.bootstrap && !state.desired && !state.current && !state.applied) {
+        const hasSession = Array.from(this.entries.values()).some((entry) => entry.hostId === hostId)
+        if (!state.bootstrap && !state.desired && !state.current && !state.applied && !hasSession) {
           return Response.json({ ok: false, reason: 'host_not_found' }, { status: 404 })
         }
         return Response.json(state)
@@ -272,7 +274,6 @@ class FakeRoutingStub {
 
       if (request.method === 'DELETE' && action === null) {
         this.bootstrap.delete(hostId)
-        this.hostTokens.delete(hostId)
         this.desired.delete(hostId)
         this.current.delete(hostId)
         this.applied.delete(hostId)
@@ -281,9 +282,11 @@ class FakeRoutingStub {
 
       if (request.method === 'PUT' && action === 'desired') {
         const body = (await request.json()) as { services: NonNullable<HostControlState['desired']>['services'] }
+        const generation = (this.generationCounters.get(hostId) ?? 0) + 1
+        this.generationCounters.set(hostId, generation)
         const desired = {
           hostId,
-          generation: (this.desired.get(hostId)?.generation ?? 0) + 1,
+          generation,
           services: body.services,
           updatedAt: Date.now(),
         }
@@ -896,7 +899,386 @@ describe('edge app integration', () => {
   })
 
 
+  test('clears host control state through control shell tRPC', async () => {
+    const env = {
+      ...createEnv(),
+      UI_PASSWORD: 'console-password',
+      SESSION_SECRET: 'session-secret',
+      SESSION_TTL_MS: '3600000',
+    }
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-remove/desired',
+      {
+        method: 'POST',
+        headers: {
+          authorization: 'Bearer dev-operator-token',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          services: [
+            {
+              serviceId: 'svc-remove',
+              serviceName: 'remove',
+              localUrl: 'http://127.0.0.1:3001',
+              protocol: 'http',
+              subdomain: 'remove.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+
+    const executionCtx = { waitUntil() {}, passThroughOnException() {} }
+    let cookieHeader: string | null = null
+
+    const client = createTRPCProxyClient<AppRouter>({
+      links: [
+        httpBatchLink({
+          url: 'http://edge.test/trpc',
+          fetch: async (url, options) => {
+            const headers = new Headers(options?.headers)
+            if (cookieHeader) {
+              headers.set('cookie', cookieHeader)
+            }
+
+            const requestInit: RequestInit = {
+              method: options?.method ?? 'GET',
+              headers,
+            }
+            if (options && 'body' in options) {
+              requestInit.body = options.body ?? null
+            }
+
+            const response = await handleEdgeFetch(new Request(String(url), requestInit), env, executionCtx)
+            const setCookie = response.headers.get('set-cookie')
+            if (setCookie) {
+              cookieHeader = setCookie.split(';')[0] ?? null
+            }
+            return response
+          },
+        }),
+      ],
+    })
+
+    await client.auth.login.mutate({ password: 'console-password' })
+    await client.hosts.remove.mutate({ hostId: 'host-remove' })
+
+    const hostsResponse = await app.request(
+      'http://edge.test/api/control/hosts',
+      { headers: { authorization: 'Bearer dev-operator-token' } },
+      env,
+    )
+    const hostsJson = (await hostsResponse.json()) as HostControlState[]
+    expect(hostsResponse.status).toBe(200)
+    expect(hostsJson).toHaveLength(0)
+  })
+
+  test('clearing control state keeps online host session, routes, and host token active', async () => {
+    const env = {
+      ...createEnv(),
+      UI_PASSWORD: 'console-password',
+      SESSION_SECRET: 'session-secret',
+      SESSION_TTL_MS: '3600000',
+    }
+    const operatorHeader = {
+      authorization: 'Bearer dev-operator-token',
+      'content-type': 'application/json',
+    }
+    const services = [
+      {
+        serviceId: 'svc-live',
+        serviceName: 'live',
+        localUrl: 'http://127.0.0.1:3001',
+        protocol: 'http' as const,
+        subdomain: 'live.example.test',
+      },
+    ]
+
+    const issueResponse = await app.request(
+      'http://edge.test/api/control/hosts/host-live/bootstrap',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({
+          hostname: 'host-live.local',
+          edgeBaseUrl: 'http://edge.test',
+        }),
+      },
+      env,
+    )
+    const issueJson = (await issueResponse.json()) as { bootstrapToken: string }
+    expect(issueResponse.status).toBe(200)
+
+    const claimResponse = await app.request(
+      'http://edge.test/api/bootstrap/claim',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          hostId: 'host-live',
+          hostname: 'host-live.local',
+          bootstrapToken: issueJson.bootstrapToken,
+        }),
+      },
+      env,
+    )
+    const claimJson = (await claimResponse.json()) as { token: string }
+    expect(claimResponse.status).toBe(200)
+
+    const hostAuthHeader = {
+      authorization: `Bearer ${claimJson.token}`,
+      'content-type': 'application/json',
+    }
+
+    const desiredResponse = await app.request(
+      'http://edge.test/api/control/hosts/host-live/desired',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ services }),
+      },
+      env,
+    )
+    expect(desiredResponse.status).toBe(200)
+
+    const currentResponse = await app.request(
+      'http://edge.test/api/control/hosts/host-live/current',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ generation: 1, status: 'acknowledged', services }),
+      },
+      env,
+    )
+    expect(currentResponse.status).toBe(200)
+
+    const appliedResponse = await app.request(
+      'http://edge.test/api/control/hosts/host-live/applied',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({ generation: 1, services }),
+      },
+      env,
+    )
+    expect(appliedResponse.status).toBe(200)
+
+    const registerResponse = await app.request(
+      'http://edge.test/api/hosts/host-live/services',
+      {
+        method: 'POST',
+        headers: hostAuthHeader,
+        body: JSON.stringify({
+          sessionId: 'session-live',
+          version: 1,
+          services,
+        }),
+      },
+      env,
+    )
+    expect(registerResponse.status).toBe(200)
+
+    const executionCtx = { waitUntil() {}, passThroughOnException() {} }
+    let cookieHeader: string | null = null
+
+    const client = createTRPCProxyClient<AppRouter>({
+      links: [
+        httpBatchLink({
+          url: 'http://edge.test/trpc',
+          fetch: async (url, options) => {
+            const headers = new Headers(options?.headers)
+            if (cookieHeader) {
+              headers.set('cookie', cookieHeader)
+            }
+
+            const requestInit: RequestInit = {
+              method: options?.method ?? 'GET',
+              headers,
+            }
+            if (options && 'body' in options) {
+              requestInit.body = options.body ?? null
+            }
+
+            const response = await handleEdgeFetch(new Request(String(url), requestInit), env, executionCtx)
+            const setCookie = response.headers.get('set-cookie')
+            if (setCookie) {
+              cookieHeader = setCookie.split(';')[0] ?? null
+            }
+            return response
+          },
+        }),
+      ],
+    })
+
+    await client.auth.login.mutate({ password: 'console-password' })
+    await client.hosts.remove.mutate({ hostId: 'host-live' })
+
+    const hostsResponse = await app.request(
+      'http://edge.test/api/control/hosts',
+      { headers: { authorization: 'Bearer dev-operator-token' } },
+      env,
+    )
+    const hostsJson = (await hostsResponse.json()) as Array<
+      HostControlState & {
+        runtime: {
+          sessionId: string
+          version: number
+          healthy: boolean
+          lastHeartbeatAt: number | null
+          disconnectedAt: number | null
+          serviceCount: number
+        } | null
+      }
+    >
+    const hostState = hostsJson.find((host) => host.hostId === 'host-live')
+    expect(hostsResponse.status).toBe(200)
+    expect(hostState?.bootstrap).toBeNull()
+    expect(hostState?.desired).toBeNull()
+    expect(hostState?.current).toBeNull()
+    expect(hostState?.applied).toBeNull()
+    expect(hostState?.runtime?.sessionId).toBe('session-live')
+
+    const detailResponse = await app.request(
+      'http://edge.test/api/control/hosts/host-live',
+      { headers: { authorization: 'Bearer dev-operator-token' } },
+      env,
+    )
+    const detailJson = (await detailResponse.json()) as HostControlState & {
+      runtime: {
+        sessionId: string
+        version: number
+        healthy: boolean
+        lastHeartbeatAt: number | null
+        disconnectedAt: number | null
+        serviceCount: number
+      } | null
+    }
+    expect(detailResponse.status).toBe(200)
+    expect(detailJson.hostId).toBe('host-live')
+    expect(detailJson.bootstrap).toBeNull()
+    expect(detailJson.desired).toBeNull()
+    expect(detailJson.current).toBeNull()
+    expect(detailJson.applied).toBeNull()
+    expect(detailJson.runtime?.sessionId).toBe('session-live')
+
+    const routesResponse = await app.request(
+      'http://edge.test/api/routes',
+      { headers: { authorization: 'Bearer dev-operator-token' } },
+      env,
+    )
+    const routesJson = (await routesResponse.json()) as RoutingEntry[]
+    expect(routesResponse.status).toBe(200)
+    expect(routesJson.some((route) => route.hostId === 'host-live' && route.hostname === 'live.example.test')).toBe(true)
+
+    const tokenVerifyResponse = await app.request(
+      'http://edge.test/api/hosts/host-live/token/verify',
+      {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${claimJson.token}`,
+        },
+      },
+      env,
+    )
+    expect(tokenVerifyResponse.status).toBe(200)
+
+    const nextDesiredResponse = await app.request(
+      'http://edge.test/api/control/hosts/host-live/desired',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({
+          services: [
+            {
+              serviceId: 'svc-live-next',
+              serviceName: 'live-next',
+              localUrl: 'http://127.0.0.1:3002',
+              protocol: 'http',
+              subdomain: 'live-next.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+    const nextDesiredJson = (await nextDesiredResponse.json()) as { generation: number }
+    expect(nextDesiredResponse.status).toBe(200)
+    expect(nextDesiredJson.generation).toBe(2)
+
+    const nextCurrentResponse = await app.request(
+      'http://edge.test/api/control/hosts/host-live/current',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({
+          generation: 2,
+          status: 'acknowledged',
+          services: [
+            {
+              serviceId: 'svc-live-next',
+              serviceName: 'live-next',
+              localUrl: 'http://127.0.0.1:3002',
+              protocol: 'http',
+              subdomain: 'live-next.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+    expect(nextCurrentResponse.status).toBe(200)
+
+    const nextAppliedResponse = await app.request(
+      'http://edge.test/api/control/hosts/host-live/applied',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({
+          generation: 2,
+          services: [
+            {
+              serviceId: 'svc-live-next',
+              serviceName: 'live-next',
+              localUrl: 'http://127.0.0.1:3002',
+              protocol: 'http',
+              subdomain: 'live-next.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+    expect(nextAppliedResponse.status).toBe(200)
+
+    const reRegisterResponse = await app.request(
+      'http://edge.test/api/hosts/host-live/services',
+      {
+        method: 'POST',
+        headers: hostAuthHeader,
+        body: JSON.stringify({
+          sessionId: 'session-live',
+          version: 2,
+          services,
+        }),
+      },
+      env,
+    )
+    expect(reRegisterResponse.status).toBe(200)
+
+    const tunnelResponse = await app.request(
+      'http://edge.test/tunnel/demo?ok=1',
+      { headers: { host: 'live.example.test' } },
+      env,
+    )
+    const tunnelJson = (await tunnelResponse.json()) as Record<string, string | null>
+    expect(tunnelResponse.status).toBe(200)
+    expect(tunnelJson.serviceId).toBe('svc-live')
+  })
+
   test('supports control shell tRPC login, me, summary, and logout flow', async () => {
+
     const env = {
       ...createEnv(),
       UI_PASSWORD: 'console-password',

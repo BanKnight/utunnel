@@ -10,6 +10,7 @@ import {
 import {
   applyDesiredHostServices,
   createControlApiToken,
+  deleteHostControlState,
   listControlApiTokens,
   listControlPlaneHosts,
   listServiceReachabilitySummaries,
@@ -131,6 +132,19 @@ export const appRouter = t.router({
             message: error instanceof Error ? error.message : 'invalid_static_config',
           })
         }
+      }),
+    remove: protectedProcedure
+      .input(
+        z.object({
+          hostId: z.string().min(1),
+        }),
+      )
+      .mutation(async ({ ctx, input }) => {
+        const result = await deleteHostControlState(ctx.env, input.hostId)
+        if (!result.ok) {
+          throw new TRPCError({ code: 'BAD_REQUEST', message: result.reason })
+        }
+        return result.value
       }),
   }),
   services: t.router({

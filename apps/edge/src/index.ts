@@ -122,6 +122,10 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
     return `desired:${hostId}`
   }
 
+  private desiredGenerationKey(hostId: string) {
+    return `desired-generation:${hostId}`
+  }
+
   private currentKey(hostId: string) {
     return `current:${hostId}`
   }
@@ -684,7 +688,6 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
           this.ctx.storage.delete(this.desiredKey(hostId)),
           this.ctx.storage.delete(this.currentKey(hostId)),
           this.ctx.storage.delete(this.appliedKey(hostId)),
-          this.ctx.storage.delete(this.hostTokenKey(hostId)),
         ])
         return Response.json({ ok: true })
       }
@@ -693,13 +696,18 @@ export class RoutingDirectory extends DurableObject<EdgeBindings> {
         try {
           const body = (await request.json()) as { services: DesiredHostConfig['services'] }
           const existing = await this.ctx.storage.get<DesiredHostConfig>(this.desiredKey(hostId))
+          const generationCounter = await this.ctx.storage.get<number>(this.desiredGenerationKey(hostId))
+          const generation = Math.max(existing?.generation ?? 0, generationCounter ?? 0) + 1
           const desired = desiredHostConfigSchema.parse({
             hostId,
-            generation: (existing?.generation ?? 0) + 1,
+            generation,
             services: normalizeServiceDefinitions(body.services ?? []),
             updatedAt: Date.now(),
           })
-          await this.ctx.storage.put(this.desiredKey(hostId), desired)
+          await Promise.all([
+            this.ctx.storage.put(this.desiredKey(hostId), desired),
+            this.ctx.storage.put(this.desiredGenerationKey(hostId), generation),
+          ])
           return Response.json(desired)
         } catch (error) {
           return Response.json(

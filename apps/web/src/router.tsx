@@ -560,6 +560,7 @@ function HostsPage() {
   const [hostEditors, setHostEditors] = useState<Record<string, ControlPlaneServiceDraft[]>>(() => buildHostEditors(loaderData))
   const [hostNotices, setHostNotices] = useState<Record<string, HostNotice | null>>({})
   const [savingHostIds, setSavingHostIds] = useState<Record<string, boolean>>({})
+  const [deletingHostIds, setDeletingHostIds] = useState<Record<string, boolean>>({})
   const [tokens, setTokens] = useState<ControlApiTokenMetadata[]>([])
   const [hostId, setHostId] = useState('')
   const [hostname, setHostname] = useState('')
@@ -576,10 +577,14 @@ function HostsPage() {
 
   const reloadHosts = async (syncHostIds: string[] = []) => {
     const previousHosts = hostsRef.current
-    const nextHosts = (await trpcClient.hosts.list.query()) as ControlPlaneHost[]
+    const [nextHosts, nextReachability] = await Promise.all([
+      trpcClient.hosts.list.query() as Promise<ControlPlaneHost[]>,
+      trpcClient.services.reachability.query() as Promise<ControlPlaneServiceReachabilitySummary[]>,
+    ])
     setHostEditors((currentEditors) => mergeHostEditors(currentEditors, previousHosts, nextHosts, syncHostIds))
     hostsRef.current = nextHosts
     setHosts(nextHosts)
+    setReachabilitySummaries(nextReachability)
   }
 
   useEffect(() => {
@@ -734,6 +739,8 @@ function HostsPage() {
           const isDirty = !areServicesEqual(editableServices, baselineServices)
           const isSavingHost = Boolean(savingHostIds[host.hostId])
           const isImportingHost = Boolean(importingHostIds[host.hostId])
+          const isDeletingHost = Boolean(deletingHostIds[host.hostId])
+          const isHostBusy = isSavingHost || isImportingHost || isDeletingHost
           const isImportOpen = Boolean(importOpenHostIds[host.hostId])
           const hostNotice = hostNotices[host.hostId] ?? null
           const importDraft = importDrafts[host.hostId] ?? ''
@@ -803,12 +810,13 @@ function HostsPage() {
               <div className="flex items-center justify-between gap-3">
                 <div>
                   <p className="text-sm font-medium text-slate-200">Desired services editor</p>
-                  <p className="text-sm text-slate-500">直接编辑并保存 desired.services。</p>
+                  <p className="text-sm text-slate-500">直接编辑并保存 desired.services；必要时可清空当前 host 的 control state。</p>
                 </div>
                 <div className="flex gap-2">
                   <Button
                     type="button"
                     className="bg-slate-800 text-slate-100 hover:bg-slate-700"
+                    disabled={isHostBusy}
                     onClick={() => {
                       setHostNotices((current) => ({ ...current, [host.hostId]: null }))
                       setHostEditors((current) => ({
@@ -822,6 +830,7 @@ function HostsPage() {
                   <Button
                     type="button"
                     className="bg-slate-800 text-slate-100 hover:bg-slate-700"
+                    disabled={isHostBusy}
                     onClick={() => {
                       setHostNotices((current) => ({ ...current, [host.hostId]: null }))
                       setImportOpenHostIds((current) => ({
@@ -835,7 +844,7 @@ function HostsPage() {
                   <Button
                     type="button"
                     className="bg-slate-800 text-slate-100 hover:bg-slate-700"
-                    disabled={!isDirty || isSavingHost}
+                    disabled={!isDirty || isHostBusy}
                     onClick={() => {
                       setHostNotices((current) => ({ ...current, [host.hostId]: null }))
                       setHostEditors((current) => ({
@@ -848,7 +857,7 @@ function HostsPage() {
                   </Button>
                   <Button
                     type="button"
-                    disabled={isSavingHost || !isDirty || validation.hasErrors}
+                    disabled={isHostBusy || !isDirty || validation.hasErrors}
                     onClick={async () => {
                       if (validation.hasErrors) {
                         setHostNotices((current) => ({
@@ -883,6 +892,39 @@ function HostsPage() {
                   >
                     {isSavingHost ? '保存中...' : '保存 desired'}
                   </Button>
+                  <Button
+                    type="button"
+                    className="bg-rose-900 text-rose-100 hover:bg-rose-800"
+                    disabled={isHostBusy}
+                    onClick={async () => {
+                      if (!window.confirm(`确认清空 host ${host.hostId} 的 control state 吗？这不会断开当前在线 session；主要清空 bootstrap / desired/current/applied 等控制面记录。`)) {
+                        return
+                      }
+
+                      setDeletingHostIds((current) => ({ ...current, [host.hostId]: true }))
+                      setHostNotices((current) => ({ ...current, [host.hostId]: null }))
+                      try {
+                        await trpcClient.hosts.remove.mutate({ hostId: host.hostId })
+                        await reloadHosts([host.hostId])
+                        setImportDrafts((current) => ({ ...current, [host.hostId]: '' }))
+                        setImportOpenHostIds((current) => ({ ...current, [host.hostId]: false }))
+                        setHostNotices((current) => ({
+                          ...current,
+                          [host.hostId]: { tone: 'success', text: 'control state 已清空。' },
+                        }))
+                      } catch {
+                        setHostNotices((current) => ({
+                          ...current,
+                          [host.hostId]: { tone: 'error', text: '清空 control state 失败。' },
+                        }))
+                      } finally {
+                        setDeletingHostIds((current) => ({ ...current, [host.hostId]: false }))
+                      }
+                    }}
+                  >
+                    {deletingHostIds[host.hostId] ? '清空中...' : '清空 control state'}
+                  </Button>
+
                 </div>
               </div>
               {hostNotice ? (
@@ -906,6 +948,7 @@ function HostsPage() {
                         <Input
                           placeholder="service id"
                           value={service.serviceId}
+                          disabled={isHostBusy}
                           onChange={(event) => {
                             const value = event.target.value
                             setHostEditors((current) => ({
@@ -920,6 +963,7 @@ function HostsPage() {
                         <Input
                           placeholder="service name"
                           value={service.serviceName}
+                          disabled={isHostBusy}
                           onChange={(event) => {
                             const value = event.target.value
                             setHostEditors((current) => ({
@@ -934,6 +978,7 @@ function HostsPage() {
                         <Input
                           placeholder="local url"
                           value={service.localUrl}
+                          disabled={isHostBusy}
                           onChange={(event) => {
                             const value = event.target.value
                             setHostEditors((current) => ({
@@ -948,6 +993,7 @@ function HostsPage() {
                         <select
                           className="flex h-10 w-full rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-sky-500"
                           value={service.protocol}
+                          disabled={isHostBusy}
                           onChange={(event) => {
                             const value = event.target.value as ServiceProtocol
                             setHostEditors((current) => ({
@@ -964,6 +1010,7 @@ function HostsPage() {
                         <Input
                           placeholder="subdomain"
                           value={service.subdomain}
+                          disabled={isHostBusy}
                           onChange={(event) => {
                             const value = event.target.value
                             setHostEditors((current) => ({
@@ -977,6 +1024,7 @@ function HostsPage() {
                       <Button
                         type="button"
                         className="bg-slate-800 text-slate-100 hover:bg-slate-700"
+                        disabled={isHostBusy}
                         onClick={() => {
                           setHostEditors((current) => ({
                             ...current,
@@ -1000,6 +1048,7 @@ function HostsPage() {
                     <Button
                       type="button"
                       className="bg-slate-800 text-slate-100 hover:bg-slate-700"
+                      disabled={isHostBusy}
                       onClick={() => {
                         setImportOpenHostIds((current) => ({ ...current, [host.hostId]: false }))
                       }}
@@ -1011,6 +1060,7 @@ function HostsPage() {
                     className="min-h-32 w-full rounded-md border border-slate-800 bg-slate-950 p-3 text-sm text-slate-100"
                     placeholder='{"services":[...]}'
                     value={importDraft}
+                    disabled={isHostBusy}
                     onChange={(event) => {
                       const value = event.target.value
                       setImportDrafts((current) => ({ ...current, [host.hostId]: value }))
@@ -1019,7 +1069,7 @@ function HostsPage() {
                   <div className="flex justify-end">
                     <Button
                       type="button"
-                      disabled={isImportingHost || importDraft.length === 0}
+                      disabled={isHostBusy || importDraft.length === 0}
                       onClick={async () => {
                         setImportingHostIds((current) => ({ ...current, [host.hostId]: true }))
                         setHostNotices((current) => ({ ...current, [host.hostId]: null }))
