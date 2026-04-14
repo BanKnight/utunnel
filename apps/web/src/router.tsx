@@ -85,10 +85,12 @@ type ControlPlaneHost = {
     status: 'pending' | 'acknowledged' | 'error'
     services: ControlPlaneService[]
     error?: string
+    reportedAt: number
   } | null
   applied: {
     generation: number
     services: ControlPlaneService[]
+    appliedAt: number
   } | null
   projectedRoutes: Array<{ hostname: string; serviceId: string; generation: number }>
   runtime: {
@@ -751,7 +753,10 @@ function HostsPage() {
               <div className="text-right text-sm text-slate-400">
                 <p>desired g{host.desired?.generation ?? '—'}</p>
                 <p>current g{host.current?.generation ?? '—'} · {host.current?.status ?? '—'}</p>
+                <p>reported: {host.current?.reportedAt ? new Date(host.current.reportedAt).toLocaleTimeString() : '—'}</p>
+                {host.current?.error ? <p className="text-rose-400">error: {host.current.error}</p> : null}
                 <p>applied g{host.applied?.generation ?? '—'}</p>
+                <p>applied: {host.applied?.appliedAt ? new Date(host.applied.appliedAt).toLocaleTimeString() : '—'}</p>
               </div>
             </div>
             <div className="rounded-md border border-slate-800 p-4 space-y-3">
