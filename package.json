@@ -12,12 +12,17 @@
     "demo:v1": "bun run smoke:v1",
     "smoke:v1": "bun run packages/testkit/src/v1-smoke.ts",
     "smoke:v2": "bun run packages/testkit/src/v2-smoke.ts",
+    "lint": "bunx oxlint apps packages",
+    "format": "bunx oxfmt --write apps/agent/src apps/edge/src apps/edge-tail/src apps/web/src packages/config/src packages/protocol/src packages/testkit/src apps/edge/wrangler.jsonc apps/edge-tail/wrangler.jsonc apps/web/vite.config.ts",
+    "format:check": "bunx oxfmt --check apps/agent/src apps/edge/src apps/edge-tail/src apps/web/src packages/config/src packages/protocol/src packages/testkit/src apps/edge/wrangler.jsonc apps/edge-tail/wrangler.jsonc apps/web/vite.config.ts",
     "typecheck": "bun x tsc --noEmit -p packages/protocol/tsconfig.json && bun x tsc --noEmit -p packages/config/tsconfig.json && bun x tsc --noEmit -p packages/testkit/tsconfig.json && bun x tsc --noEmit -p apps/edge/tsconfig.json && bun x tsc --noEmit -p apps/edge-tail/tsconfig.json && bun x tsc --noEmit -p apps/agent/tsconfig.json && bun x tsc --noEmit -p apps/web/tsconfig.json",
     "test": "bun test ./packages ./apps",
-    "check": "bun run typecheck && bun run test"
+    "check": "bun run lint && bun run typecheck && bun run test"
   },
   "devDependencies": {
     "bun-types": "latest",
+    "oxfmt": "^0.45.0",
+    "oxlint": "^1.60.0",
     "typescript": "^5.6.3"
   }
 }
