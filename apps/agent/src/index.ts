@@ -48,6 +48,7 @@ export type RelayState = {
 export type AgentRuntimeContext = {
   activeServices: ServiceDefinition[]
   appliedGeneration: number | null
+  applyingGeneration: number | null
 }
 
 const loadConfig = async () => {
@@ -170,8 +171,21 @@ const connectHostSession = async (edgeBaseUrl: string, hostId: string, token: st
     } as any,
   )
   await new Promise<void>((resolve, reject) => {
-    socket.addEventListener('open', () => resolve(), { once: true })
-    socket.addEventListener('error', () => reject(new Error('websocket connection failed')), { once: true })
+    const timeout = setTimeout(() => {
+      reject(new Error('websocket connection timeout'))
+    }, 5_000)
+    socket.addEventListener('open', () => {
+      clearTimeout(timeout)
+      resolve()
+    }, { once: true })
+    socket.addEventListener('error', () => {
+      clearTimeout(timeout)
+      reject(new Error('websocket connection failed'))
+    }, { once: true })
+    socket.addEventListener('close', (event) => {
+      clearTimeout(timeout)
+      reject(new Error(`websocket connection closed:${event.code}`))
+    }, { once: true })
   })
   return socket
 }
@@ -462,6 +476,11 @@ const applyDesiredConfig = async (
     return
   }
 
+  if (runtime.applyingGeneration === dispatch.payload.generation) {
+    return
+  }
+
+  runtime.applyingGeneration = dispatch.payload.generation
   sendReconcileAck(socket, config.hostId, dispatch.payload.generation, 'acknowledged')
 
   try {
@@ -483,6 +502,10 @@ const applyDesiredConfig = async (
       'error',
       error instanceof Error ? error.message : 'apply_failed',
     )
+  } finally {
+    if (runtime.applyingGeneration === dispatch.payload.generation) {
+      runtime.applyingGeneration = null
+    }
   }
 }
 
@@ -550,6 +573,7 @@ const runAgentCycle = async (config: AgentConfig, state: RuntimeState) => {
   const runtime: AgentRuntimeContext = {
     activeServices: desired?.services ?? config.services,
     appliedGeneration: desired?.generation ?? null,
+    applyingGeneration: null,
   }
 
   const socket = await connectHostSession(config.edgeBaseUrl, config.hostId, token)
@@ -574,6 +598,7 @@ const runAgentCycle = async (config: AgentConfig, state: RuntimeState) => {
 
   return { socket, heartbeat }
 }
+
 
 const runAgent = async (config: AgentConfig) => {
   let state = createNextRuntimeState()

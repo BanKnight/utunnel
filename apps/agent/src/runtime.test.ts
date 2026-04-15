@@ -448,7 +448,7 @@ describe('agent runtime helpers', () => {
     })
   })
 
-  test('applies config_dispatch and sends reconcile acknowledgements without polluting relay state', async () => {
+  test('deduplicates repeated in-flight config_dispatch for the same generation', async () => {
     const runtime: AgentRuntimeContext = {
       activeServices: [
         {
@@ -460,6 +460,7 @@ describe('agent runtime helpers', () => {
         },
       ],
       appliedGeneration: null,
+      applyingGeneration: null,
     }
     const state = createNextRuntimeState()
     const config = parseAgentConfig({
@@ -471,39 +472,44 @@ describe('agent runtime helpers', () => {
     })
     const edgeMessages: string[] = []
 
+    const dispatchMessage = JSON.stringify({
+      type: 'config_dispatch',
+      payload: {
+        hostId: 'host-1',
+        generation: 3,
+        desired: {
+          hostId: 'host-1',
+          generation: 3,
+          updatedAt: Date.now(),
+          services: [
+            {
+              serviceId: 'svc-new',
+              serviceName: 'new',
+              localUrl: 'http://127.0.0.1:3101',
+              protocol: 'http',
+              subdomain: 'new.example.test',
+            },
+          ],
+        },
+        dispatchedAt: Date.now(),
+        idempotencyKey: 'dispatch-1',
+      },
+    })
+
     const originalFetch = globalThis.fetch
     const fetchCalls: Array<{ url: string; body: unknown }> = []
+    let pendingFetchResolver!: (value: Response) => void
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = input instanceof Request ? input : new Request(input, init)
       fetchCalls.push({ url: request.url, body: await request.json() })
-      return Response.json({ ok: true, mode: 'rebind' })
+      return await new Promise<Response>((resolve) => {
+        pendingFetchResolver = resolve
+      })
     }) as typeof fetch
 
     try {
-      await handleAgentSocketMessage(
-        JSON.stringify({
-          type: 'config_dispatch',
-          payload: {
-            hostId: 'host-1',
-            generation: 3,
-            desired: {
-              hostId: 'host-1',
-              generation: 3,
-              updatedAt: Date.now(),
-              services: [
-                {
-                  serviceId: 'svc-new',
-                  serviceName: 'new',
-                  localUrl: 'http://127.0.0.1:3101',
-                  protocol: 'http',
-                  subdomain: 'new.example.test',
-                },
-              ],
-            },
-            dispatchedAt: Date.now(),
-            idempotencyKey: 'dispatch-1',
-          },
-        }),
+      const firstApply = handleAgentSocketMessage(
+        dispatchMessage,
         runtime,
         state,
         config,
@@ -511,11 +517,39 @@ describe('agent runtime helpers', () => {
         createRelayState(),
         'host-token',
       )
+      await Promise.resolve()
+
+      const secondApply = handleAgentSocketMessage(
+        dispatchMessage,
+        runtime,
+        state,
+        config,
+        { send: (data: string) => edgeMessages.push(data) },
+        createRelayState(),
+        'host-token',
+      )
+      await Promise.resolve()
+
+      expect(fetchCalls).toHaveLength(1)
+      expect(edgeMessages.map((item) => JSON.parse(item))).toEqual([
+        {
+          type: 'reconcile_ack',
+          payload: {
+            hostId: 'host-1',
+            generation: 3,
+            status: 'acknowledged',
+            acknowledgedAt: expect.any(Number),
+          },
+        },
+      ])
+
+      pendingFetchResolver(Response.json({ ok: true, mode: 'rebind' }))
+      await firstApply
+      await secondApply
     } finally {
       globalThis.fetch = originalFetch
     }
 
-    expect(fetchCalls).toHaveLength(1)
     expect(fetchCalls[0]?.url).toContain('/api/hosts/host-1/services')
     expect(runtime.appliedGeneration).toBe(3)
     expect(runtime.activeServices.map((service) => service.serviceId)).toEqual(['svc-new'])
@@ -540,4 +574,6 @@ describe('agent runtime helpers', () => {
       },
     ])
   })
+
 })
+
