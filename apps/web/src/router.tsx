@@ -907,7 +907,6 @@ function HostsPage() {
                         await trpcClient.hosts.remove.mutate({ hostId: host.hostId })
                         await reloadHosts([host.hostId])
                         setImportDrafts((current) => ({ ...current, [host.hostId]: '' }))
-                        setImportOpenHostIds((current) => ({ ...current, [host.hostId]: false }))
                         setHostNotices((current) => ({
                           ...current,
                           [host.hostId]: { tone: 'success', text: 'control state 已清空。' },
@@ -1042,8 +1041,8 @@ function HostsPage() {
                 <div className="rounded-md border border-dashed border-slate-800 p-4 space-y-3">
                   <div className="flex items-start justify-between gap-3">
                     <div>
-                      <p className="text-sm font-medium text-slate-200">导入 static config</p>
-                      <p className="text-sm text-slate-500">把旧静态配置导入到当前 host 的编辑草稿，确认后再保存 desired。</p>
+                      <p className="text-sm font-medium text-slate-200">Import static config</p>
+                      <p className="text-sm text-slate-500">把旧静态配置迁移到当前 host 的 desired.services。导入后会立即接管到可视化编辑器。</p>
                     </div>
                     <Button
                       type="button"
@@ -1080,15 +1079,16 @@ function HostsPage() {
                             hostId: host.hostId,
                             services: importedServices,
                           })) as { services: ControlPlaneService[] }
-                          setHostEditors((current) => ({
-                            ...current,
-                            [host.hostId]: result.services.map(toServiceDraft),
-                          }))
+                          await trpcClient.hosts.upsertDesired.mutate({
+                            hostId: host.hostId,
+                            services: result.services,
+                          })
+                          await reloadHosts([host.hostId])
                           setImportDrafts((current) => ({ ...current, [host.hostId]: '' }))
                           setImportOpenHostIds((current) => ({ ...current, [host.hostId]: false }))
                           setHostNotices((current) => ({
                             ...current,
-                            [host.hostId]: { tone: 'success', text: 'static config 已导入到草稿，请确认后保存。' },
+                            [host.hostId]: { tone: 'success', text: 'static config 已导入，已切换到可视化编辑。' },
                           }))
                         } catch {
                           setHostNotices((current) => ({
@@ -1100,7 +1100,7 @@ function HostsPage() {
                         }
                       }}
                     >
-                      {isImportingHost ? '导入中...' : '导入到草稿'}
+                      {isImportingHost ? '导入中...' : '导入到该 Host'}
                     </Button>
                   </div>
                 </div>
