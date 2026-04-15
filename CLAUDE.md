@@ -6,7 +6,8 @@
 - Main apps:
   - `apps/edge` — Cloudflare edge worker
   - `apps/agent` — Bun host agent
-  - `apps/web` — reserved only, not part of v1 delivery
+  - `apps/web` — v2 control shell UI for browser login, dashboard, host management, and desired-state editing
+  - `apps/edge-tail` — local/dev tail consumer for edge observability workflows when enabled
 - Shared packages:
   - `packages/protocol`
   - `packages/config`
@@ -17,6 +18,7 @@
 
 - `bun run demo:v1` — alias of the repo-runnable v1 smoke flow
 - `bun run smoke:v1` — boot local edge + demo agents and verify 3-host HTTP/WebSocket routing
+- `bun run smoke:v2` — boot local v2 control-plane flow and verify login/bootstrap/import/desired/apply/HTTP/WS end to end
 - `bun run typecheck`
 - `bun run test`
 - `bun run check`
@@ -34,12 +36,18 @@
   - `HostSession` owns live host session state and relay behavior
   - top-level fetch handles `/tunnel/*` websocket upgrades before Hono routing when needed by local dev / wrangler
   - host heartbeat updates are persisted here
+- `apps/edge/src/control-shell.ts`
+  - browser session login/logout and dashboard summary shaping for the v2 UI
+- `apps/edge/src/trpc.ts`
+  - session-protected control-shell API for hosts, bootstrap, tokens, and desired-state mutations
 - `apps/agent/src/index.ts`
   - host registration
   - reconnect/rebind flow
   - structured heartbeat sender
   - HTTP relay
   - WebSocket relay with frame queueing until upstream socket open
+- `apps/web/src/router.tsx`
+  - v2 control shell routes, host cards, desired/current/applied display, desired service editor, and per-host static import UI
 - `packages/protocol/src/index.ts`
   - shared schemas and tunnel message types
   - host session heartbeat schema lives here
@@ -75,3 +83,4 @@
   - `bun run typecheck`
   - `bun run test`
   - `bun run smoke:v1` for edge/agent/testkit changes that affect v1 routing, health, websocket relay, or startup flow
+  - `bun run smoke:v2` for v2 control-shell, bootstrap, desired-state editing/import, token lifecycle, or control-plane convergence changes
