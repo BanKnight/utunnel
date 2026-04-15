@@ -79,8 +79,22 @@
   - `apps/agent/src/runtime.test.ts`
 - When changing local dev ingress override or websocket tunnel behavior, update `apps/edge/src/app.ts`, `apps/edge/src/index.ts`, and `apps/edge/src/index.test.ts` together.
 - When changing repo-runnable demo/smoke behavior, update `packages/testkit/src/index.ts`, `packages/testkit/src/v1-smoke.ts`, and root `package.json` scripts together.
-- Before concluding work, run:
-  - `bun run typecheck`
-  - `bun run test`
-  - `bun run smoke:v1` for edge/agent/testkit changes that affect v1 routing, health, websocket relay, or startup flow
-  - `bun run smoke:v2` for v2 control-shell, bootstrap, desired-state editing/import, token lifecycle, or control-plane convergence changes
+## Skill routing
+
+When the user's request matches an available skill, ALWAYS invoke it using the Skill
+tool as your FIRST action. Do NOT answer directly, do NOT use other tools first.
+The skill has specialized workflows that produce better results than ad-hoc answers.
+
+Key routing rules:
+- Product ideas, "is this worth building", brainstorming → invoke office-hours
+- Bugs, errors, "why is this broken", 500 errors → invoke investigate
+- Ship, deploy, push, create PR → invoke ship
+- QA, test the site, find bugs → invoke qa
+- Code review, check my diff → invoke review
+- Update docs after shipping → invoke document-release
+- Weekly retro → invoke retro
+- Design system, brand → invoke design-consultation
+- Visual audit, design polish → invoke design-review
+- Architecture review → invoke plan-eng-review
+- Save progress, checkpoint, resume → invoke checkpoint
+- Code quality, health check → invoke health
