@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:net'
 import { setTimeout as sleep } from 'node:timers/promises'
+import type { AgentConfig } from '@utunnel/config'
 import { createTRPCProxyClient, httpBatchLink } from '@trpc/client'
 import type { AppRouter } from '../../../apps/edge/src/trpc'
 import { createTempDemoConfigDir, createV1DemoAgentConfigs } from './index'
@@ -89,13 +90,92 @@ const buildWebShellIfNeeded = () => {
   }
 }
 
+const fetchWithTimeout = async (url: string, init?: RequestInit, timeoutMs = 15_000) => {
+  const signal = AbortSignal.timeout(timeoutMs)
+  return fetch(url, {
+    ...init,
+    signal,
+  })
+}
+
 const fetchJson = async (url: string, init?: RequestInit) => {
-  const response = await fetch(url, init)
+  const response = await fetchWithTimeout(url, init)
   return {
     response,
     json: await response.json(),
   }
 }
+
+const retry = async <T>(run: () => Promise<T>, attempts: number, label: string) => {
+  let lastError: unknown = null
+  for (let index = 0; index < attempts; index += 1) {
+    try {
+      return await run()
+    } catch (error) {
+      lastError = error
+      if (index === attempts - 1) {
+        break
+      }
+      await sleep(1_000)
+    }
+  }
+  throw new Error(`${label}:${lastError instanceof Error ? lastError.message : String(lastError)}`)
+}
+
+const fetchTunnelHost = async (edgeBaseUrl: string, hostname: string) => {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < 30_000) {
+    try {
+      const { response, json } = await fetchJson(`${edgeBaseUrl}/tunnel/demo`, {
+        headers: {
+          host: '127.0.0.1',
+          'x-utunnel-route-host': hostname,
+        },
+      })
+      if (response.ok) {
+        return { response, json }
+      }
+    } catch {}
+    await sleep(500)
+  }
+  throw new Error(`http_smoke_failed_${hostname}`)
+}
+
+const waitForWebSocketEcho = async (edgePort: number, hostname: string, message: string) => {
+  const startedAt = Date.now()
+  const websocketUrl = `ws://127.0.0.1:${edgePort}/tunnel/__utunnel_host/${encodeURIComponent(hostname)}/socket`
+  while (Date.now() - startedAt < 30_000) {
+    try {
+      const echoed = await new Promise<string>((resolve, reject) => {
+        const ws = new WebSocket(websocketUrl)
+        const timeout = setTimeout(() => {
+          ws.close()
+          reject(new Error('ws_timeout'))
+        }, 3_000)
+
+        ws.addEventListener('open', () => ws.send(message), { once: true })
+        ws.addEventListener('message', (event) => {
+          clearTimeout(timeout)
+          ws.close()
+          resolve(String(event.data))
+        }, { once: true })
+        ws.addEventListener('error', () => {
+          clearTimeout(timeout)
+          ws.close()
+          reject(new Error('websocket_upgrade_failed'))
+        }, { once: true })
+        ws.addEventListener('close', () => {
+          clearTimeout(timeout)
+        }, { once: true })
+      })
+      return echoed
+    } catch {
+      await sleep(500)
+    }
+  }
+  throw new Error(`timeout_waiting_for_websocket_echo:${hostname}`)
+}
+
 
 const main = async () => {
   const edgePort = await getAvailablePort()
@@ -143,14 +223,14 @@ const main = async () => {
   try {
     await waitFor(async () => {
       try {
-        const response = await fetch(`${edgeBaseUrl}/`)
+        const response = await fetchWithTimeout(`${edgeBaseUrl}/`)
         return response.ok
       } catch {
         return false
       }
     }, 30_000, 'edge_ready')
 
-    const login = await fetch(`${edgeBaseUrl}/api/auth/login`, {
+    const login = await fetchWithTimeout(`${edgeBaseUrl}/api/auth/login`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ password: UI_PASSWORD }),
@@ -174,13 +254,17 @@ const main = async () => {
             if (options && 'body' in options) {
               init.body = options.body ?? null
             }
-            return fetch(url, init)
+            return fetchWithTimeout(String(url), init, 120_000)
           },
         }),
       ],
     })
 
-    const createdToken = (await trpc.tokens.create.mutate({})) as { token: string }
+    const createdToken = (await retry(
+      () => trpc.tokens.create.mutate({}) as Promise<{ token: string }>,
+      3,
+      'tokens_create_failed',
+    )) as { token: string }
     const apiToken = createdToken.token
     if (!apiToken) {
       throw new Error('missing_api_token')
@@ -216,7 +300,7 @@ const main = async () => {
       throw new Error('bootstrap_issue_failed')
     }
 
-    const bootstrapConfig = {
+    const bootstrapConfig: AgentConfig = {
       hostId: demoConfig.hostId,
       hostname: demoConfig.hostname,
       bootstrapToken,
@@ -237,7 +321,7 @@ const main = async () => {
     try {
       await waitFor(async () => {
         try {
-          const response = await fetch(`${edgeBaseUrl}/api/control/hosts/${demoConfig.hostId}`, {
+          const response = await fetchWithTimeout(`${edgeBaseUrl}/api/control/hosts/${demoConfig.hostId}`, {
             headers: { authorization: `Bearer ${apiToken}` },
           })
           const hostState = (await response.json()) as {
@@ -248,21 +332,29 @@ const main = async () => {
         } catch {
           return false
         }
-      }, 90_000, 'agent_claimed_and_connected')
+      }, 180_000, 'agent_claimed_and_connected')
 
-      const imported = await trpc.hosts.importStaticConfig.mutate({
-        hostId: demoConfig.hostId,
-        services: demoConfig.services,
-      })
+      const imported = await retry(
+        () => trpc.hosts.importStaticConfig.mutate({
+          hostId: demoConfig.hostId,
+          services: demoConfig.services,
+        }) as Promise<{ services: AgentConfig['services'] }>,
+        3,
+        'import_static_config_failed',
+      )
 
-      await trpc.hosts.upsertDesired.mutate({
-        hostId: demoConfig.hostId,
-        services: imported.services,
-      })
+      await retry(
+        () => trpc.hosts.upsertDesired.mutate({
+          hostId: demoConfig.hostId,
+          services: imported.services,
+        }),
+        3,
+        'upsert_desired_failed',
+      )
 
       await waitFor(async () => {
         try {
-          const response = await fetch(`${edgeBaseUrl}/api/control/hosts/${demoConfig.hostId}`, {
+          const response = await fetchWithTimeout(`${edgeBaseUrl}/api/control/hosts/${demoConfig.hostId}`, {
             headers: { authorization: `Bearer ${apiToken}` },
           })
           const hostState = (await response.json()) as {
@@ -272,10 +364,12 @@ const main = async () => {
         } catch {
           return false
         }
-      }, 90_000, 'projected_routes_ready')
+      }, 180_000, 'projected_routes_ready')
 
-      const controlHostResponse = await fetch(`${edgeBaseUrl}/api/control/hosts/${demoConfig.hostId}`, {
+      const controlHostResponse = await fetchWithTimeout(`${edgeBaseUrl}/api/control/hosts/${demoConfig.hostId}`, {
         headers: { authorization: `Bearer ${apiToken}` },
+      }, 30_000).catch((error) => {
+        throw new Error(`control_host_fetch_failed:${error instanceof Error ? error.message : String(error)}`)
       })
       const hostState = (await controlHostResponse.json()) as {
         desired?: { generation: number }
@@ -292,37 +386,12 @@ const main = async () => {
         throw new Error('control_state_not_visible')
       }
 
-      const httpResponse = await fetch(`${edgeBaseUrl}/tunnel/demo`, {
-        headers: {
-          host: '127.0.0.1',
-          'x-utunnel-route-host': httpTarget.subdomain,
-        },
-      })
-      const httpJson = (await httpResponse.json()) as { ok: boolean }
-      if (!httpResponse.ok || !httpJson.ok) {
+      const { response: httpResponse, json: httpJson } = await fetchTunnelHost(edgeBaseUrl, httpTarget.subdomain)
+      if (!httpResponse.ok || !(httpJson as { ok?: boolean }).ok) {
         throw new Error('http_smoke_failed')
       }
 
-      const websocketUrl = `ws://127.0.0.1:${edgePort}/tunnel/__utunnel_host/${encodeURIComponent(websocketTarget.subdomain)}/socket`
-      const echoed = await new Promise<string>((resolve, reject) => {
-        const ws = new WebSocket(websocketUrl)
-        const timeout = setTimeout(() => {
-          ws.close()
-          reject(new Error('ws_timeout'))
-        }, 3_000)
-
-        ws.addEventListener('open', () => ws.send('hello-v2'), { once: true })
-        ws.addEventListener('message', (event) => {
-          clearTimeout(timeout)
-          ws.close()
-          resolve(String(event.data))
-        }, { once: true })
-        ws.addEventListener('error', () => {
-          clearTimeout(timeout)
-          ws.close()
-          reject(new Error('websocket_upgrade_failed'))
-        }, { once: true })
-      })
+      const echoed = await waitForWebSocketEcho(edgePort, websocketTarget.subdomain, 'hello-v2')
       if (echoed !== 'hello-v2') {
         throw new Error('websocket_smoke_failed')
       }

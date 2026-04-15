@@ -36,6 +36,7 @@ import {
   deleteHostControlState,
   claimHostBootstrap,
   getDesiredHostConfig,
+  getHostControlState,
   issueHostBootstrap,
   listAppliedRouteProjections,
   listControlApiTokens,
@@ -595,12 +596,28 @@ export const createEdgeApp = () => {
     }
 
     const hostId = c.req.param('hostId')
-    const host = (await listControlPlaneHosts(c.env)).find((entry) => entry.hostId === hostId) ?? null
-    if (!host) {
+    const state = await getHostControlState(c.env, hostId)
+    if (!state) {
       return Response.json({ ok: false, reason: 'host_not_found' }, { status: 404 })
     }
 
-    return c.json(host)
+    const edgeEnv = parseEdgeEnv(c.env)
+    const hostSessionResponse = await getHostStub(c.env, hostId).fetch('https://host.internal/session')
+    const session = (await hostSessionResponse.json()) as HostSessionRecord | null
+
+    return c.json({
+      ...state,
+      runtime: session
+        ? {
+            sessionId: session.sessionId,
+            version: session.version,
+            healthy: isSessionHealthy(session, edgeEnv.HEARTBEAT_GRACE_MS),
+            lastHeartbeatAt: session.lastHeartbeatAt,
+            disconnectedAt: session.disconnectedAt,
+            serviceCount: session.services.length,
+          }
+        : null,
+    })
   })
 
   app.get('/api/control/hosts', async (c) => {

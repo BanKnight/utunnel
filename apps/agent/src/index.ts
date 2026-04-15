@@ -173,7 +173,7 @@ const connectHostSession = async (edgeBaseUrl: string, hostId: string, token: st
   await new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => {
       reject(new Error('websocket connection timeout'))
-    }, 5_000)
+    }, 20_000)
     socket.addEventListener('open', () => {
       clearTimeout(timeout)
       resolve()
