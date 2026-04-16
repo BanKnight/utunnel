@@ -162,11 +162,52 @@ type HostNotice = {
 
 type ServiceFieldError = Partial<Record<'serviceId' | 'serviceName' | 'localUrl' | 'subdomain', string>>
 
+type HostsLocateSearch = {
+  hostId?: string
+  serviceId?: string
+  focus?: 'reachability'
+}
+
+type PageNotice = {
+  tone: 'info' | 'error'
+  text: string
+}
+
 type ServiceValidationResult = {
   fieldErrors: ServiceFieldError[]
   messages: string[]
   hasErrors: boolean
 }
+
+const normalizeHostsLocateSearch = (search: Record<string, unknown>): HostsLocateSearch => {
+  const hostId = typeof search.hostId === 'string' && search.hostId.length > 0 ? search.hostId : null
+  const serviceId = typeof search.serviceId === 'string' && search.serviceId.length > 0 ? search.serviceId : null
+  const focus = search.focus === 'reachability' ? 'reachability' : null
+
+  const normalized: HostsLocateSearch = {}
+  if (hostId) {
+    normalized.hostId = hostId
+  }
+  if (serviceId) {
+    normalized.serviceId = serviceId
+  }
+  if (focus) {
+    normalized.focus = focus
+  }
+  return normalized
+}
+
+const buildHostsLocateKey = (search: HostsLocateSearch) => {
+  if (!search.hostId) {
+    return null
+  }
+  return `${search.hostId}::${search.serviceId ?? ''}::${search.focus ?? ''}`
+}
+
+const buildReachabilityRowKey = (hostId: string, serviceId: string) => {
+  return `${hostId}::${serviceId}`
+}
+
 
 const createServiceRowId = () => {
   return `svc-row-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
@@ -208,6 +249,12 @@ const cloneServices = (services: ControlPlaneService[] | null | undefined) => {
 
 const REACHABILITY_BAR_COUNT = 12
 const REACHABILITY_STALE_MS = 15 * 60 * 1000
+const LOCATE_HIGHLIGHT_MS = 2_000
+
+const scrollNodeIntoView = (node: HTMLElement | null) => {
+  node?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+}
+
 
 type ReachabilityBarResult = ControlPlaneServiceReachabilitySummary['recentResults'][number]
 
@@ -460,6 +507,7 @@ const dashboardRoute = createRoute({
 const hostsRoute = createRoute({
   getParentRoute: () => authedRoute,
   path: '/hosts',
+  validateSearch: normalizeHostsLocateSearch,
   loader: async ({ context }) => {
     return context.trpc.hosts.list.query() as Promise<ControlPlaneHost[]>
   },
@@ -683,7 +731,12 @@ function DashboardPage() {
                   key={host.hostId}
                   type="button"
                   className="w-full rounded-md border border-slate-800 px-4 py-3 text-left hover:border-sky-500"
-                  onClick={() => navigate({ to: '/hosts' })}
+                  onClick={() => navigate({
+                    to: '/hosts',
+                    search: {
+                      hostId: host.hostId,
+                    },
+                  })}
                 >
                   <div className="flex items-start justify-between gap-4">
                     <div>
@@ -735,7 +788,14 @@ function DashboardPage() {
                   key={`${service.hostId}-${service.serviceId}`}
                   type="button"
                   className="w-full rounded-md border border-slate-800 px-4 py-3 text-left hover:border-sky-500"
-                  onClick={() => navigate({ to: '/hosts' })}
+                  onClick={() => navigate({
+                    to: '/hosts',
+                    search: {
+                      hostId: service.hostId,
+                      serviceId: service.serviceId,
+                      focus: 'reachability',
+                    },
+                  })}
                 >
                   <div className="flex items-start justify-between gap-4">
                     <div>
@@ -765,10 +825,12 @@ function DashboardPage() {
 
 function HostsPage() {
   const loaderData = hostsRoute.useLoaderData() as ControlPlaneHost[]
+  const locateSearch = hostsRoute.useSearch() as HostsLocateSearch
   const [hosts, setHosts] = useState<ControlPlaneHost[]>(loaderData)
   const hostsRef = useRef(loaderData)
   const [hostEditors, setHostEditors] = useState<Record<string, ControlPlaneServiceDraft[]>>(() => buildHostEditors(loaderData))
   const [hostNotices, setHostNotices] = useState<Record<string, HostNotice | null>>({})
+  const [pageNotice, setPageNotice] = useState<PageNotice | null>(null)
   const [savingHostIds, setSavingHostIds] = useState<Record<string, boolean>>({})
   const [deletingHostIds, setDeletingHostIds] = useState<Record<string, boolean>>({})
   const [tokens, setTokens] = useState<ControlApiTokenMetadata[]>([])
@@ -782,19 +844,64 @@ function HostsPage() {
   const [issuing, setIssuing] = useState(false)
   const [creatingToken, setCreatingToken] = useState(false)
   const [reachabilitySummaries, setReachabilitySummaries] = useState<ControlPlaneServiceReachabilitySummary[]>([])
+  const [reachabilityState, setReachabilityState] = useState<'loading' | 'ready' | 'error'>('loading')
   const [importingHostIds, setImportingHostIds] = useState<Record<string, boolean>>({})
   const [importOpenHostIds, setImportOpenHostIds] = useState<Record<string, boolean>>({})
+  const [highlightedHostId, setHighlightedHostId] = useState<string | null>(null)
+  const [highlightedReachabilityKey, setHighlightedReachabilityKey] = useState<string | null>(null)
+  const hostCardRefs = useRef<Record<string, HTMLDivElement | null>>({})
+  const reachabilityRowRefs = useRef<Record<string, HTMLDivElement | null>>({})
+  const locateProgressRef = useRef<{
+    key: string | null
+    hostDone: boolean
+    serviceDone: boolean
+    settled: boolean
+  }>({
+    key: null,
+    hostDone: false,
+    serviceDone: false,
+    settled: false,
+  })
+  const hostHighlightTimeoutRef = useRef<number | null>(null)
+  const reachabilityHighlightTimeoutRef = useRef<number | null>(null)
+
+  const flashHostHighlight = (nextHostId: string) => {
+    setHighlightedHostId(nextHostId)
+    if (hostHighlightTimeoutRef.current !== null) {
+      window.clearTimeout(hostHighlightTimeoutRef.current)
+    }
+    hostHighlightTimeoutRef.current = window.setTimeout(() => {
+      setHighlightedHostId((current) => (current === nextHostId ? null : current))
+      hostHighlightTimeoutRef.current = null
+    }, LOCATE_HIGHLIGHT_MS)
+  }
+
+  const flashReachabilityHighlight = (nextKey: string) => {
+    setHighlightedReachabilityKey(nextKey)
+    if (reachabilityHighlightTimeoutRef.current !== null) {
+      window.clearTimeout(reachabilityHighlightTimeoutRef.current)
+    }
+    reachabilityHighlightTimeoutRef.current = window.setTimeout(() => {
+      setHighlightedReachabilityKey((current) => (current === nextKey ? null : current))
+      reachabilityHighlightTimeoutRef.current = null
+    }, LOCATE_HIGHLIGHT_MS)
+  }
 
   const reloadHosts = async (syncHostIds: string[] = []) => {
     const previousHosts = hostsRef.current
-    const [nextHosts, nextReachability] = await Promise.all([
-      trpcClient.hosts.list.query() as Promise<ControlPlaneHost[]>,
-      trpcClient.services.reachability.query() as Promise<ControlPlaneServiceReachabilitySummary[]>,
-    ])
+    const nextHosts = await (trpcClient.hosts.list.query() as Promise<ControlPlaneHost[]>)
     setHostEditors((currentEditors) => mergeHostEditors(currentEditors, previousHosts, nextHosts, syncHostIds))
     hostsRef.current = nextHosts
     setHosts(nextHosts)
-    setReachabilitySummaries(nextReachability)
+
+    setReachabilityState('loading')
+    try {
+      const nextReachability = await (trpcClient.services.reachability.query() as Promise<ControlPlaneServiceReachabilitySummary[]>)
+      setReachabilitySummaries(nextReachability)
+      setReachabilityState('ready')
+    } catch {
+      setReachabilityState('error')
+    }
   }
 
   useEffect(() => {
@@ -809,13 +916,111 @@ function HostsPage() {
       setTokens([])
     })
 
+    setReachabilityState('loading')
     void trpcClient.services.reachability.query().then((result) => {
       setReachabilitySummaries(result as ControlPlaneServiceReachabilitySummary[])
+      setReachabilityState('ready')
     }).catch(() => {
-      setReachabilitySummaries([])
+      setReachabilityState('error')
     })
   }, [])
 
+  useEffect(() => {
+    return () => {
+      if (hostHighlightTimeoutRef.current !== null) {
+        window.clearTimeout(hostHighlightTimeoutRef.current)
+      }
+      if (reachabilityHighlightTimeoutRef.current !== null) {
+        window.clearTimeout(reachabilityHighlightTimeoutRef.current)
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    const nextKey = buildHostsLocateKey(locateSearch)
+    if (nextKey !== locateProgressRef.current.key) {
+      locateProgressRef.current = {
+        key: nextKey,
+        hostDone: false,
+        serviceDone: false,
+        settled: false,
+      }
+      setPageNotice(null)
+    }
+  }, [locateSearch])
+
+  useEffect(() => {
+    const locateKey = buildHostsLocateKey(locateSearch)
+    if (!locateKey || !locateSearch.hostId) {
+      return
+    }
+
+    const progress = locateProgressRef.current
+    if (progress.key !== locateKey) {
+      return
+    }
+    if (progress.settled) {
+      return
+    }
+
+    const targetHost = hosts.find((host) => host.hostId === locateSearch.hostId)
+    if (!targetHost) {
+      setPageNotice({ tone: 'error', text: '目标已不存在或状态已变化。' })
+      progress.settled = true
+      return
+    }
+
+    if (!progress.hostDone) {
+      scrollNodeIntoView(hostCardRefs.current[targetHost.hostId] ?? null)
+      flashHostHighlight(targetHost.hostId)
+      progress.hostDone = true
+
+      if (!locateSearch.serviceId || locateSearch.focus !== 'reachability') {
+        progress.serviceDone = true
+        progress.settled = true
+        setPageNotice(null)
+        return
+      }
+    }
+
+    if (!locateSearch.serviceId || locateSearch.focus !== 'reachability') {
+      progress.settled = true
+      return
+    }
+
+    if (reachabilityState === 'loading') {
+      setPageNotice({ tone: 'info', text: '正在定位目标 service 的连通性位置…' })
+      return
+    }
+
+    if (reachabilityState === 'error') {
+      setPageNotice({ tone: 'error', text: '连通性数据加载失败。' })
+      progress.settled = true
+      return
+    }
+
+    const targetSummary = reachabilitySummaries.find(
+      (summary) => summary.hostId === locateSearch.hostId && summary.serviceId === locateSearch.serviceId,
+    )
+
+    if (!targetSummary) {
+      setPageNotice({ tone: 'error', text: '目标已不存在或状态已变化。' })
+      progress.settled = true
+      return
+    }
+
+    const rowKey = buildReachabilityRowKey(targetSummary.hostId, targetSummary.serviceId)
+    const rowNode = reachabilityRowRefs.current[rowKey] ?? null
+    if (!rowNode) {
+      return
+    }
+
+    scrollNodeIntoView(rowNode)
+    flashReachabilityHighlight(rowKey)
+    progress.serviceDone = true
+    progress.settled = true
+    setPageNotice(null)
+  }, [hosts, locateSearch, reachabilityState, reachabilitySummaries])
 
   return (
     <div className="space-y-6">
@@ -823,6 +1028,11 @@ function HostsPage() {
         <h2 className="text-2xl font-semibold text-slate-50">Hosts</h2>
         <p className="text-sm text-slate-400">Phase 4 增加最小 bootstrap onboarding command 生成。</p>
       </div>
+      {pageNotice ? (
+        <Card className={pageNotice.tone === 'error' ? 'border-rose-500/40 bg-rose-500/10' : 'border-sky-500/40 bg-sky-500/10'}>
+          <p className={pageNotice.tone === 'error' ? 'text-sm text-rose-300' : 'text-sm text-sky-200'}>{pageNotice.text}</p>
+        </Card>
+      ) : null}
       <Card className="space-y-4">
         <div>
           <h3 className="text-lg font-medium text-slate-50">新增 Host</h3>
@@ -955,8 +1165,15 @@ function HostsPage() {
           const hostNotice = hostNotices[host.hostId] ?? null
           const importDraft = importDrafts[host.hostId] ?? ''
           const serviceSummaries = reachabilitySummaries.filter((summary) => summary.hostId === host.hostId)
+          const isHostHighlighted = highlightedHostId === host.hostId
           return (
-          <Card key={host.hostId} className="space-y-4">
+          <div
+            key={host.hostId}
+            ref={(node: HTMLDivElement | null) => {
+              hostCardRefs.current[host.hostId] = node
+            }}
+          >
+            <Card className={`space-y-4 ${isHostHighlighted ? 'border-sky-500 bg-sky-500/10' : ''}`}>
             <div className="flex items-center justify-between gap-4">
               <div>
                 <h3 className="text-lg font-medium text-slate-50">{host.hostId}</h3>
@@ -986,8 +1203,16 @@ function HostsPage() {
                   {serviceSummaries.map((summary) => {
                     const reachabilityLabel = getReachabilityLabel(summary)
                     const bars = buildReachabilityBars(summary.recentResults)
+                    const reachabilityKey = buildReachabilityRowKey(summary.hostId, summary.serviceId)
+                    const isReachabilityHighlighted = highlightedReachabilityKey === reachabilityKey
                     return (
-                      <div key={`${summary.hostId}-${summary.serviceId}`} className="rounded-md border border-slate-800 px-4 py-3">
+                      <div
+                        key={`${summary.hostId}-${summary.serviceId}`}
+                        className={`rounded-md border px-4 py-3 ${isReachabilityHighlighted ? 'border-sky-500 bg-sky-500/10' : 'border-slate-800'}`}
+                        ref={(node: HTMLDivElement | null) => {
+                          reachabilityRowRefs.current[reachabilityKey] = node
+                        }}
+                      >
                         <div className="flex items-start justify-between gap-4">
                           <div>
                             <p className="font-medium text-slate-100">{summary.serviceName} · {summary.subdomain}</p>
@@ -1342,6 +1567,7 @@ function HostsPage() {
               />
             </div>
           </Card>
+        </div>
         )})}
         {hosts.length === 0 ? (
           <Card>
