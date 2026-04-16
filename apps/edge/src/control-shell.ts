@@ -1,7 +1,11 @@
 import { parseEdgeEnv } from '@utunnel/config'
-import type { HostSessionRecord, RoutingEntry } from '@utunnel/protocol'
-import { isSessionHealthy } from './lib'
-import type { EdgeBindings, FetchStub } from './types'
+import type { RoutingEntry, ServiceReachability } from '@utunnel/protocol'
+import {
+  listControlPlaneHosts,
+  listServiceReachabilitySummaries,
+  type ControlPlaneServiceReachabilitySummary,
+} from './control-plane'
+import type { EdgeBindings } from './types'
 
 const SESSION_COOKIE_NAME = 'utunnel_session'
 const DEFAULT_SESSION_TTL_MS = 24 * 60 * 60 * 1000
@@ -26,12 +30,35 @@ export type DashboardSummary = {
   onlineHostCount: number
   routeCount: number
   unhealthyHostCount: number
+  pendingBootstrapCount: number
+  desiredDriftCount: number
+  reachableServiceCount: number
+  degradedServiceCount: number
+  unreachableServiceCount: number
+  staleServiceCount: number
   recentHosts: Array<{
     hostId: string
     healthy: boolean
     disconnectedAt: number | null
     lastHeartbeatAt: number | null
     serviceCount: number
+    desiredGeneration: number | null
+    currentGeneration: number | null
+    currentStatus: 'pending' | 'acknowledged' | 'error' | null
+    appliedGeneration: number | null
+    projectedRouteCount: number
+    problematicServiceCount: number
+    staleServiceCount: number
+  }>
+  problemServices: Array<{
+    hostId: string
+    serviceId: string
+    serviceName: string
+    subdomain: string
+    reachability: ServiceReachability
+    checkedAt: number | null
+    currentStatus: 'pending' | 'acknowledged' | 'error' | null
+    runtimeHealthy: boolean | null
   }>
 }
 
@@ -39,8 +66,27 @@ const getRoutingStub = (env: EdgeBindings) => {
   return env.ROUTING_DIRECTORY.get(env.ROUTING_DIRECTORY.idFromName('global'))
 }
 
-const getHostStub = (env: EdgeBindings, hostId: string) => {
-  return env.HOST_SESSION.get(env.HOST_SESSION.idFromName(hostId))
+
+const REACHABILITY_STALE_MS = 15 * 60 * 1000
+
+const isReachabilityStale = (checkedAt: number | null) => {
+  if (checkedAt === null) {
+    return false
+  }
+  return Date.now() - checkedAt > REACHABILITY_STALE_MS
+}
+
+const countProblematicServices = (summaries: ControlPlaneServiceReachabilitySummary[]) => {
+  return summaries.filter((summary) => {
+    if (isReachabilityStale(summary.checkedAt)) {
+      return true
+    }
+    return summary.reachability === 'degraded' || summary.reachability === 'unreachable'
+  }).length
+}
+
+const countStaleServices = (summaries: ControlPlaneServiceReachabilitySummary[]) => {
+  return summaries.filter((summary) => isReachabilityStale(summary.checkedAt)).length
 }
 
 const encodeBase64Url = (value: string) => {
@@ -199,38 +245,99 @@ export const getAuthenticatedControlShellUser = async (request: Request, env: Ed
 }
 
 export const summarizeDashboard = async (env: EdgeBindings): Promise<DashboardSummary> => {
-  const edgeEnv = parseEdgeEnv(env)
-  const routing = getRoutingStub(env)
-  const routesResponse = await routing.fetch('https://routing.internal/list')
+  const hosts = await listControlPlaneHosts(env)
+  const reachabilitySummaries = await listServiceReachabilitySummaries(env)
+  const routesResponse = await getRoutingStub(env).fetch('https://routing.internal/list')
   const routes = (await routesResponse.json()) as RoutingEntry[]
-  const hostIds = Array.from(new Set(routes.map((route) => route.hostId)))
 
-  const hosts = await Promise.all(
-    hostIds.map(async (hostId) => {
-      const hostStub = getHostStub(env, hostId)
-      const response = await hostStub.fetch('https://host.internal/session')
-      const session = (await response.json()) as HostSessionRecord | null
-      const healthy = isSessionHealthy(session, edgeEnv.HEARTBEAT_GRACE_MS)
-      const lastSeenAt = Math.max(session?.disconnectedAt ?? 0, session?.lastHeartbeatAt ?? 0, session?.connectedAt ?? 0)
+  const reachabilityByHostId = new Map<string, ControlPlaneServiceReachabilitySummary[]>()
+  for (const summary of reachabilitySummaries) {
+    const current = reachabilityByHostId.get(summary.hostId)
+    if (current) {
+      current.push(summary)
+    } else {
+      reachabilityByHostId.set(summary.hostId, [summary])
+    }
+  }
+
+  const recentHosts = [...hosts]
+    .map((host) => {
+      const hostSummaries = reachabilityByHostId.get(host.hostId) ?? []
+      const lastSeenAt = Math.max(
+        host.runtime?.disconnectedAt ?? 0,
+        host.runtime?.lastHeartbeatAt ?? 0,
+        host.bootstrap?.claimedAt ?? 0,
+        host.bootstrap?.issuedAt ?? 0,
+        host.applied?.appliedAt ?? 0,
+        host.current?.reportedAt ?? 0,
+      )
 
       return {
-        hostId,
-        healthy,
-        disconnectedAt: session?.disconnectedAt ?? null,
-        lastHeartbeatAt: session?.lastHeartbeatAt ?? null,
-        serviceCount: session?.services.length ?? 0,
+        hostId: host.hostId,
+        healthy: host.runtime?.healthy ?? false,
+        disconnectedAt: host.runtime?.disconnectedAt ?? null,
+        lastHeartbeatAt: host.runtime?.lastHeartbeatAt ?? null,
+        serviceCount: host.runtime?.serviceCount ?? host.applied?.services.length ?? host.desired?.services.length ?? 0,
+        desiredGeneration: host.desired?.generation ?? null,
+        currentGeneration: host.current?.generation ?? null,
+        currentStatus: host.current?.status ?? null,
+        appliedGeneration: host.applied?.generation ?? null,
+        projectedRouteCount: host.projectedRoutes.length,
+        problematicServiceCount: countProblematicServices(hostSummaries),
+        staleServiceCount: countStaleServices(hostSummaries),
         lastSeenAt,
       }
-    }),
-  )
+    })
+    .sort((left, right) => right.lastSeenAt - left.lastSeenAt)
+    .map(({ lastSeenAt: _lastSeenAt, ...host }) => host)
+
+  const problemServices = reachabilitySummaries
+    .filter((summary) => {
+      if (isReachabilityStale(summary.checkedAt)) {
+        return true
+      }
+      return summary.reachability === 'degraded' || summary.reachability === 'unreachable'
+    })
+    .sort((left, right) => {
+      const leftScore = isReachabilityStale(left.checkedAt) ? 2 : left.reachability === 'unreachable' ? 1 : 0
+      const rightScore = isReachabilityStale(right.checkedAt) ? 2 : right.reachability === 'unreachable' ? 1 : 0
+      if (rightScore !== leftScore) {
+        return rightScore - leftScore
+      }
+      return (right.checkedAt ?? 0) - (left.checkedAt ?? 0)
+    })
+    .slice(0, 8)
+    .map((summary) => ({
+      hostId: summary.hostId,
+      serviceId: summary.serviceId,
+      serviceName: summary.serviceName,
+      subdomain: summary.subdomain,
+      reachability: isReachabilityStale(summary.checkedAt) ? 'unknown' : summary.reachability,
+      checkedAt: summary.checkedAt,
+      currentStatus: summary.currentStatus,
+      runtimeHealthy: summary.runtime?.healthy ?? null,
+    }))
 
   return {
-    hostCount: hostIds.length,
-    onlineHostCount: hosts.filter((host) => host.healthy).length,
+    hostCount: hosts.length,
+    onlineHostCount: hosts.filter((host) => host.runtime?.healthy).length,
     routeCount: routes.length,
-    unhealthyHostCount: hosts.filter((host) => !host.healthy).length,
-    recentHosts: hosts
-      .sort((left, right) => right.lastSeenAt - left.lastSeenAt)
-      .map(({ lastSeenAt: _lastSeenAt, ...host }) => host),
+    unhealthyHostCount: hosts.filter((host) => host.runtime && !host.runtime.healthy).length,
+    pendingBootstrapCount: hosts.filter((host) => host.bootstrap && host.bootstrap.claimedAt === null).length,
+    desiredDriftCount: hosts.filter((host) => {
+      if (!host.desired) {
+        return false
+      }
+      if (!host.applied) {
+        return true
+      }
+      return host.desired.generation !== host.applied.generation
+    }).length,
+    reachableServiceCount: reachabilitySummaries.filter((summary) => !isReachabilityStale(summary.checkedAt) && summary.reachability === 'reachable').length,
+    degradedServiceCount: reachabilitySummaries.filter((summary) => !isReachabilityStale(summary.checkedAt) && summary.reachability === 'degraded').length,
+    unreachableServiceCount: reachabilitySummaries.filter((summary) => !isReachabilityStale(summary.checkedAt) && summary.reachability === 'unreachable').length,
+    staleServiceCount: countStaleServices(reachabilitySummaries),
+    recentHosts,
+    problemServices,
   }
 }

@@ -21,12 +21,35 @@ type DashboardSummary = {
   onlineHostCount: number
   routeCount: number
   unhealthyHostCount: number
+  pendingBootstrapCount: number
+  desiredDriftCount: number
+  reachableServiceCount: number
+  degradedServiceCount: number
+  unreachableServiceCount: number
+  staleServiceCount: number
   recentHosts: Array<{
     hostId: string
     healthy: boolean
     disconnectedAt: number | null
     lastHeartbeatAt: number | null
     serviceCount: number
+    desiredGeneration: number | null
+    currentGeneration: number | null
+    currentStatus: 'pending' | 'acknowledged' | 'error' | null
+    appliedGeneration: number | null
+    projectedRouteCount: number
+    problematicServiceCount: number
+    staleServiceCount: number
+  }>
+  problemServices: Array<{
+    hostId: string
+    serviceId: string
+    serviceName: string
+    subdomain: string
+    reachability: 'reachable' | 'degraded' | 'unreachable' | 'unknown'
+    checkedAt: number | null
+    currentStatus: 'pending' | 'acknowledged' | 'error' | null
+    runtimeHealthy: boolean | null
   }>
 }
 
@@ -572,49 +595,170 @@ function RouteLink({ to, children }: { to: '/' | '/hosts'; children: string }) {
 
 function DashboardPage() {
   const loaderData = dashboardRoute.useLoaderData() as DashboardSummary
-  const cards = useMemo(
+  const navigate = dashboardRoute.useNavigate()
+  const hostCards = useMemo(
     () => [
-      ['Hosts', loaderData.hostCount],
-      ['Online hosts', loaderData.onlineHostCount],
-      ['Routes', loaderData.routeCount],
-      ['Unhealthy hosts', loaderData.unhealthyHostCount],
+      { label: '总 Hosts', value: loaderData.hostCount, tone: 'text-slate-50' },
+      { label: '在线 Hosts', value: loaderData.onlineHostCount, tone: 'text-emerald-400' },
+      { label: '待认领', value: loaderData.pendingBootstrapCount, tone: 'text-amber-400' },
+      { label: '配置未收敛', value: loaderData.desiredDriftCount, tone: 'text-amber-400' },
+    ],
+    [loaderData],
+  )
+  const serviceCards = useMemo(
+    () => [
+      { label: '可达 services', value: loaderData.reachableServiceCount, tone: 'text-emerald-400' },
+      { label: '不稳定', value: loaderData.degradedServiceCount, tone: 'text-amber-400' },
+      { label: '不可达', value: loaderData.unreachableServiceCount, tone: 'text-rose-400' },
+      { label: '已过期', value: loaderData.staleServiceCount, tone: 'text-slate-300' },
     ],
     [loaderData],
   )
 
   return (
     <div className="space-y-6">
-      <div>
-        <h2 className="text-2xl font-semibold text-slate-50">总览</h2>
-        <p className="mt-1 text-sm text-slate-400">Phase 1 只展示最小摘要，不进入 desired/current/applied 可视化。</p>
-      </div>
-      <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        {cards.map(([label, value]) => (
-          <Card key={label}>
-            <p className="text-sm text-slate-400">{label}</p>
-            <p className="mt-3 text-3xl font-semibold text-slate-50">{value}</p>
-          </Card>
-        ))}
-      </section>
-      <Card className="space-y-4">
+      <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
         <div>
-          <h3 className="text-lg font-medium text-slate-50">最近 Host 状态</h3>
-          <p className="text-sm text-slate-400">按最近心跳/断开时间排序。</p>
+          <h2 className="text-2xl font-semibold text-slate-50">总览</h2>
+          <p className="mt-1 text-sm text-slate-400">先看异常 host 和 service 连通性，再进入 Hosts 页面处理。</p>
         </div>
-        <div className="space-y-3">
-          {loaderData.recentHosts.map((host) => (
-            <div key={host.hostId} className="flex items-center justify-between rounded-md border border-slate-800 px-4 py-3">
-              <div>
-                <p className="font-medium text-slate-100">{host.hostId}</p>
-                <p className="text-sm text-slate-400">services: {host.serviceCount}</p>
+        <Button onClick={() => navigate({ to: '/hosts' })}>进入 Hosts</Button>
+      </div>
+
+      <section className="grid gap-4 lg:grid-cols-2">
+        <Card className="space-y-4">
+          <div>
+            <h3 className="text-lg font-medium text-slate-50">Host 概览</h3>
+            <p className="text-sm text-slate-400">看接入、在线和配置收敛情况。</p>
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            {hostCards.map((card) => (
+              <div key={card.label} className="rounded-lg border border-slate-800 bg-slate-950/60 p-4">
+                <p className="text-sm text-slate-400">{card.label}</p>
+                <p className={`mt-3 text-3xl font-semibold ${card.tone}`}>{card.value}</p>
               </div>
-              <div className={host.healthy ? 'text-emerald-400' : 'text-rose-400'}>
-                {host.healthy ? 'healthy' : 'unhealthy'}
-              </div>
+            ))}
+          </div>
+          <div className="grid gap-3 text-sm text-slate-400 sm:grid-cols-2">
+            <div className="rounded-md border border-slate-800 px-4 py-3">
+              <p className="text-slate-200">已投影 routes</p>
+              <p className="mt-1 text-xl font-semibold text-slate-50">{loaderData.routeCount}</p>
             </div>
-          ))}
-        </div>
-      </Card>
+            <div className="rounded-md border border-slate-800 px-4 py-3">
+              <p className="text-slate-200">离线 / 不健康</p>
+              <p className="mt-1 text-xl font-semibold text-rose-400">{loaderData.unhealthyHostCount}</p>
+            </div>
+          </div>
+        </Card>
+
+        <Card className="space-y-4">
+          <div>
+            <h3 className="text-lg font-medium text-slate-50">Service 连通性</h3>
+            <p className="text-sm text-slate-400">看当前可达、抖动、失败和结果是否过期。</p>
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            {serviceCards.map((card) => (
+              <div key={card.label} className="rounded-lg border border-slate-800 bg-slate-950/60 p-4">
+                <p className="text-sm text-slate-400">{card.label}</p>
+                <p className={`mt-3 text-3xl font-semibold ${card.tone}`}>{card.value}</p>
+              </div>
+            ))}
+          </div>
+          <p className="text-sm text-slate-500">过期表示最近结果太旧，不代表最新一定失败，但当前已经不够可信。</p>
+        </Card>
+      </section>
+
+      <section className="grid gap-6 xl:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)]">
+        <Card className="space-y-4">
+          <div>
+            <h3 className="text-lg font-medium text-slate-50">优先关注的 Hosts</h3>
+            <p className="text-sm text-slate-400">按最近活动排序，优先看离线、未收敛或有异常 service 的 host。</p>
+          </div>
+          <div className="space-y-3">
+            {loaderData.recentHosts.length > 0 ? loaderData.recentHosts.map((host) => {
+              const statusText = host.healthy ? '在线' : '离线'
+              const statusClassName = host.healthy ? 'text-emerald-400' : 'text-rose-400'
+              return (
+                <button
+                  key={host.hostId}
+                  type="button"
+                  className="w-full rounded-md border border-slate-800 px-4 py-3 text-left hover:border-sky-500"
+                  onClick={() => navigate({ to: '/hosts' })}
+                >
+                  <div className="flex items-start justify-between gap-4">
+                    <div>
+                      <p className="font-medium text-slate-100">{host.hostId}</p>
+                      <p className="text-sm text-slate-400">
+                        service 数: {host.serviceCount} · routes: {host.projectedRouteCount}
+                      </p>
+                    </div>
+                    <div className="text-right">
+                      <p className={`text-sm ${statusClassName}`}>{statusText}</p>
+                      <p className="text-xs text-slate-500">
+                        最近心跳：{host.lastHeartbeatAt ? new Date(host.lastHeartbeatAt).toLocaleTimeString() : '—'}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="mt-3 flex flex-wrap gap-3 text-xs text-slate-500">
+                    <p>desired g{host.desiredGeneration ?? '—'}</p>
+                    <p>current g{host.currentGeneration ?? '—'} · {host.currentStatus ?? '—'}</p>
+                    <p>applied g{host.appliedGeneration ?? '—'}</p>
+                    <p>异常 services: {host.problematicServiceCount}</p>
+                    <p>过期结果: {host.staleServiceCount}</p>
+                  </div>
+                </button>
+              )
+            }) : <p className="text-sm text-slate-500">当前还没有 host。</p>}
+          </div>
+        </Card>
+
+        <Card className="space-y-4">
+          <div>
+            <h3 className="text-lg font-medium text-slate-50">需要优先处理的 Services</h3>
+            <p className="text-sm text-slate-400">这里只列不稳定、不可达或已过期的 service。</p>
+          </div>
+          <div className="space-y-3">
+            {loaderData.problemServices.length > 0 ? loaderData.problemServices.map((service) => {
+              const reachabilityText = service.reachability === 'unreachable'
+                ? '不可达'
+                : service.reachability === 'degraded'
+                  ? '不稳定'
+                  : '已过期'
+              const reachabilityClassName = service.reachability === 'unreachable'
+                ? 'text-rose-400'
+                : service.reachability === 'degraded'
+                  ? 'text-amber-400'
+                  : 'text-slate-300'
+
+              return (
+                <button
+                  key={`${service.hostId}-${service.serviceId}`}
+                  type="button"
+                  className="w-full rounded-md border border-slate-800 px-4 py-3 text-left hover:border-sky-500"
+                  onClick={() => navigate({ to: '/hosts' })}
+                >
+                  <div className="flex items-start justify-between gap-4">
+                    <div>
+                      <p className="font-medium text-slate-100">{service.serviceName}</p>
+                      <p className="text-sm text-slate-400">{service.hostId} · {service.subdomain}</p>
+                    </div>
+                    <div className="text-right">
+                      <p className={`text-sm ${reachabilityClassName}`}>{reachabilityText}</p>
+                      <p className="text-xs text-slate-500">
+                        最近检查：{service.checkedAt ? new Date(service.checkedAt).toLocaleTimeString() : '—'}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="mt-3 flex flex-wrap gap-3 text-xs text-slate-500">
+                    <p>current: {service.currentStatus ?? '—'}</p>
+                    <p>runtime: {service.runtimeHealthy === null ? '—' : service.runtimeHealthy ? 'healthy' : 'unhealthy'}</p>
+                  </div>
+                </button>
+              )
+            }) : <p className="text-sm text-slate-500">当前没有需要优先处理的 service。</p>}
+          </div>
+        </Card>
+      </section>
     </div>
   )
 }

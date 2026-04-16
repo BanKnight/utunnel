@@ -1358,6 +1358,8 @@ describe('edge app integration', () => {
     const summaryResult = await client.dashboard.summary.query()
     expect(summaryResult.hostCount).toBe(1)
     expect(summaryResult.routeCount).toBe(1)
+    expect(summaryResult.pendingBootstrapCount).toBe(0)
+    expect(summaryResult.problemServices).toEqual([])
 
     const logoutResult = await client.auth.logout.mutate()
     expect(logoutResult).toEqual({ ok: true })
@@ -3833,10 +3835,22 @@ describe('edge app integration', () => {
       onlineHostCount: number
       routeCount: number
       unhealthyHostCount: number
+      pendingBootstrapCount: number
+      desiredDriftCount: number
+      reachableServiceCount: number
+      degradedServiceCount: number
+      unreachableServiceCount: number
+      staleServiceCount: number
       recentHosts: Array<{
         hostId: string
         healthy: boolean
         disconnectedAt: number | null
+        desiredGeneration: number | null
+        projectedRouteCount: number
+      }>
+      problemServices: Array<{
+        hostId: string
+        reachability: string
       }>
     }
 
@@ -3845,9 +3859,90 @@ describe('edge app integration', () => {
     expect(summaryJson.onlineHostCount).toBe(1)
     expect(summaryJson.routeCount).toBe(2)
     expect(summaryJson.unhealthyHostCount).toBe(1)
+    expect(summaryJson.pendingBootstrapCount).toBe(0)
+    expect(summaryJson.desiredDriftCount).toBe(0)
+    expect(summaryJson.reachableServiceCount).toBe(0)
+    expect(summaryJson.degradedServiceCount).toBe(0)
+    expect(summaryJson.unreachableServiceCount).toBe(0)
+    expect(summaryJson.staleServiceCount).toBe(0)
+    expect(summaryJson.problemServices).toEqual([])
     expect(summaryJson.recentHosts.map((host) => [host.hostId, host.healthy])).toEqual([
       ['host-2', false],
       ['host-1', true],
     ])
+  })
+
+  test('includes hosts without projected routes in dashboard summary', async () => {
+    const env = {
+      ...createEnv(),
+      UI_PASSWORD: 'console-password',
+      SESSION_SECRET: 'session-secret',
+      SESSION_TTL_MS: '3600000',
+    }
+
+    const operatorHeader = {
+      authorization: 'Bearer dev-operator-token',
+      'content-type': 'application/json',
+    }
+
+    const desiredResponse = await app.request(
+      'http://edge.test/api/control/hosts/host-drift/desired',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({
+          services: [
+            {
+              serviceId: 'svc-drift',
+              serviceName: 'drift',
+              localUrl: 'http://127.0.0.1:3010',
+              protocol: 'http',
+              subdomain: 'drift.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+
+    expect(desiredResponse.status).toBe(200)
+
+    const login = await app.request(
+      'http://edge.test/api/auth/login',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ password: 'console-password' }),
+      },
+      env,
+    )
+    const sessionCookie = login.headers.get('set-cookie')
+
+    const summary = await app.request(
+      'http://edge.test/api/dashboard/summary',
+      {
+        headers: { cookie: sessionCookie! },
+      },
+      env,
+    )
+    const summaryJson = (await summary.json()) as {
+      hostCount: number
+      desiredDriftCount: number
+      recentHosts: Array<{
+        hostId: string
+        desiredGeneration: number | null
+        projectedRouteCount: number
+      }>
+    }
+
+    expect(summary.status).toBe(200)
+    expect(summaryJson.hostCount).toBe(1)
+    expect(summaryJson.desiredDriftCount).toBe(1)
+    expect(summaryJson.recentHosts).toHaveLength(1)
+    expect(summaryJson.recentHosts[0]).toMatchObject({
+      hostId: 'host-drift',
+      desiredGeneration: 1,
+      projectedRouteCount: 0,
+    })
   })
 })
