@@ -323,6 +323,22 @@ const cloneServiceDrafts = (services: ControlPlaneServiceDraft[] | null | undefi
   return (services ?? []).map((service) => ({ ...service }))
 }
 
+function getRedispatchErrorText(reason: string): string {
+  if (reason === 'desired_not_found') {
+    return '当前 host 没有 desired，无法再次投递。'
+  }
+
+  if (reason === 'runtime_unhealthy') {
+    return '当前 host runtime 不健康，暂时不能再次投递。'
+  }
+
+  if (reason === 'host_not_connected') {
+    return '当前 host 没有 live socket，暂时无法投递 desired。'
+  }
+
+  return '再次投递 desired 失败。'
+}
+
 const buildBaselineServices = (host: ControlPlaneHost) => {
   return normalizeServices(host.desired?.services ?? host.current?.services ?? host.applied?.services)
 }
@@ -1357,16 +1373,9 @@ function HostsPage() {
                         }))
                       } catch (error) {
                         const reason = error instanceof Error ? error.message : 'redispatch_failed'
-                        const text = reason === 'desired_not_found'
-                          ? '当前 host 没有 desired，无法再次投递。'
-                          : reason === 'runtime_unhealthy'
-                            ? '当前 host runtime 不健康，暂时不能再次投递。'
-                            : reason === 'host_not_connected'
-                              ? '当前 host 没有 live socket，暂时无法投递 desired。'
-                              : '再次投递 desired 失败。'
                         setHostNotices((current) => ({
                           ...current,
-                          [host.hostId]: { tone: 'error', text },
+                          [host.hostId]: { tone: 'error', text: getRedispatchErrorText(reason) },
                         }))
                       } finally {
                         setRedispatchingHostIds((current) => ({ ...current, [host.hostId]: false }))

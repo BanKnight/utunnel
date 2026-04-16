@@ -485,13 +485,11 @@ const listReachabilitySummaryBasesFromAnalyticsEngine = async (
     })
 }
 
-export const dispatchDesiredConfigToHost = async (env: EdgeBindings, hostId: string) => {
-  const desired = await getDesiredHostConfig(env, hostId)
-  if (!desired) {
-    return { ok: true as const, dispatched: false as const }
-  }
-
-  const message = configDispatchMessageSchema.parse({
+function buildConfigDispatchMessage(
+  hostId: string,
+  desired: DesiredHostConfig,
+): ReturnType<typeof configDispatchMessageSchema.parse> {
+  return configDispatchMessageSchema.parse({
     type: 'config_dispatch',
     payload: {
       hostId,
@@ -501,9 +499,17 @@ export const dispatchDesiredConfigToHost = async (env: EdgeBindings, hostId: str
       idempotencyKey: crypto.randomUUID(),
     },
   })
+}
 
-  const response = await getHostStub(env, hostId).fetch(
-    toJsonRequest('https://host.internal/control/dispatch', message),
+export const dispatchDesiredConfigToHost = async (env: EdgeBindings, hostId: string) => {
+  const desired = await getDesiredHostConfig(env, hostId)
+  if (!desired) {
+    return { ok: true as const, dispatched: false as const }
+  }
+
+  const hostStub = getHostStub(env, hostId)
+  const response = await hostStub.fetch(
+    toJsonRequest('https://host.internal/control/dispatch', buildConfigDispatchMessage(hostId, desired)),
   )
 
   if (!response.ok) {
@@ -523,25 +529,17 @@ export const redispatchDesiredConfigToHost = async (
   }
 
   const edgeEnv = parseEdgeEnv(env)
-  const hostSessionResponse = await getHostStub(env, hostId).fetch('https://host.internal/session')
+  const hostStub = getHostStub(env, hostId)
+  const hostSessionResponse = await hostStub.fetch('https://host.internal/session')
   const session = (await readJson<HostSessionRecord | null>(hostSessionResponse)) ?? null
   if (!session || !isSessionHealthy(session, edgeEnv.HEARTBEAT_GRACE_MS)) {
     return { ok: false, status: 409, reason: 'runtime_unhealthy' }
   }
 
-  const message = configDispatchMessageSchema.parse({
-    type: 'config_dispatch',
-    payload: {
-      hostId,
-      generation: desired.generation,
-      desired,
-      dispatchedAt: Date.now(),
-      idempotencyKey: crypto.randomUUID(),
-    },
-  })
-
   const dispatchResult = await readMutationResult<{ ok: true }>(
-    await getHostStub(env, hostId).fetch(toJsonRequest('https://host.internal/control/dispatch', message)),
+    await hostStub.fetch(
+      toJsonRequest('https://host.internal/control/dispatch', buildConfigDispatchMessage(hostId, desired)),
+    ),
   )
 
   if (!dispatchResult.ok) {
