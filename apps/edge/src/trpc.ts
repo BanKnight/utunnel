@@ -16,6 +16,7 @@ import {
   listServiceReachabilitySummaries,
   issueHostBootstrap,
   normalizeAndValidateDesiredServices,
+  redispatchDesiredConfigToHost,
   revokeControlApiToken,
   rotateControlApiToken,
 } from './control-plane'
@@ -109,6 +110,19 @@ export const appRouter = t.router({
       )
       .mutation(async ({ ctx, input }) => {
         const result = await applyDesiredHostServices(ctx.env, input.hostId, input.services)
+        if (!result.ok) {
+          throw new TRPCError({ code: 'BAD_REQUEST', message: result.reason })
+        }
+        return result.value
+      }),
+    redispatch: protectedProcedure
+      .input(
+        z.object({
+          hostId: z.string().min(1),
+        }),
+      )
+      .mutation(async ({ ctx, input }) => {
+        const result = await redispatchDesiredConfigToHost(ctx.env, input.hostId)
         if (!result.ok) {
           throw new TRPCError({ code: 'BAD_REQUEST', message: result.reason })
         }

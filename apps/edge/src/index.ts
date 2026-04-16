@@ -982,7 +982,11 @@ export class HostSession extends DurableObject<EdgeBindings> {
     if (request.method === 'POST' && url.pathname === '/control/dispatch') {
       const message = configDispatchMessageSchema.parse(await request.json())
       await this.ctx.storage.put(this.dispatchKey(message.payload.generation), message)
-      this.getHostSocket()?.send(JSON.stringify(message))
+      const hostSocket = this.getHostSocket()
+      if (!hostSocket) {
+        return Response.json({ ok: false, reason: 'host_not_connected' }, { status: 503 })
+      }
+      hostSocket.send(JSON.stringify(message))
       return Response.json({ ok: true })
     }
 

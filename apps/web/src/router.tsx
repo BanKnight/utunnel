@@ -833,6 +833,7 @@ function HostsPage() {
   const [pageNotice, setPageNotice] = useState<PageNotice | null>(null)
   const [savingHostIds, setSavingHostIds] = useState<Record<string, boolean>>({})
   const [deletingHostIds, setDeletingHostIds] = useState<Record<string, boolean>>({})
+  const [redispatchingHostIds, setRedispatchingHostIds] = useState<Record<string, boolean>>({})
   const [tokens, setTokens] = useState<ControlApiTokenMetadata[]>([])
   const [hostId, setHostId] = useState('')
   const [hostname, setHostname] = useState('')
@@ -1160,7 +1161,9 @@ function HostsPage() {
           const isSavingHost = Boolean(savingHostIds[host.hostId])
           const isImportingHost = Boolean(importingHostIds[host.hostId])
           const isDeletingHost = Boolean(deletingHostIds[host.hostId])
-          const isHostBusy = isSavingHost || isImportingHost || isDeletingHost
+          const isRedispatchingHost = Boolean(redispatchingHostIds[host.hostId])
+          const canRedispatch = host.desired !== null && host.runtime?.healthy === true
+          const isHostBusy = isSavingHost || isImportingHost || isDeletingHost || isRedispatchingHost
           const isImportOpen = Boolean(importOpenHostIds[host.hostId])
           const hostNotice = hostNotices[host.hostId] ?? null
           const importDraft = importDrafts[host.hostId] ?? ''
@@ -1334,6 +1337,43 @@ function HostsPage() {
                     }}
                   >
                     {isSavingHost ? '保存中...' : '保存 desired'}
+                  </Button>
+                  <Button
+                    type="button"
+                    className="bg-slate-800 text-slate-100 hover:bg-slate-700"
+                    disabled={isHostBusy || !canRedispatch}
+                    onClick={async () => {
+                      setRedispatchingHostIds((current) => ({ ...current, [host.hostId]: true }))
+                      setHostNotices((current) => ({ ...current, [host.hostId]: null }))
+                      try {
+                        const result = await trpcClient.hosts.redispatch.mutate({ hostId: host.hostId }) as { generation: number }
+                        await reloadHosts([host.hostId])
+                        setHostNotices((current) => ({
+                          ...current,
+                          [host.hostId]: {
+                            tone: 'success',
+                            text: `已再次投递 desired g${result.generation}；若目标已在同一代，可能只补回执，不会重新应用。`,
+                          },
+                        }))
+                      } catch (error) {
+                        const reason = error instanceof Error ? error.message : 'redispatch_failed'
+                        const text = reason === 'desired_not_found'
+                          ? '当前 host 没有 desired，无法再次投递。'
+                          : reason === 'runtime_unhealthy'
+                            ? '当前 host runtime 不健康，暂时不能再次投递。'
+                            : reason === 'host_not_connected'
+                              ? '当前 host 没有 live socket，暂时无法投递 desired。'
+                              : '再次投递 desired 失败。'
+                        setHostNotices((current) => ({
+                          ...current,
+                          [host.hostId]: { tone: 'error', text },
+                        }))
+                      } finally {
+                        setRedispatchingHostIds((current) => ({ ...current, [host.hostId]: false }))
+                      }
+                    }}
+                  >
+                    {isRedispatchingHost ? '再次投递中...' : 'redispatch desired'}
                   </Button>
                   <Button
                     type="button"

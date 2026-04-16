@@ -411,6 +411,7 @@ class FakeHostStub {
       }
     }
   } | null = null
+  dispatchConnected = true
   lastRelayWs: {
     expectedSessionId: string
     expectedVersion: number
@@ -537,6 +538,9 @@ class FakeHostStub {
     }
 
     if (request.method === 'POST' && url.pathname === '/control/dispatch') {
+      if (!this.dispatchConnected) {
+        return Response.json({ ok: false, reason: 'host_not_connected' }, { status: 503 })
+      }
       return Response.json({ ok: true })
     }
 
@@ -896,6 +900,175 @@ describe('edge app integration', () => {
     )
     const desiredJson = (await desired.json()) as HostControlState[]
     expect(desiredJson).toHaveLength(0)
+  })
+
+  test('supports redispatch mutation with strict backend reasons', async () => {
+    const env = {
+      ...createEnv(),
+      UI_PASSWORD: 'console-password',
+      SESSION_SECRET: 'session-secret',
+      SESSION_TTL_MS: '3600000',
+    }
+
+    const operatorHeader = {
+      authorization: 'Bearer dev-operator-token',
+      'content-type': 'application/json',
+    }
+
+    const executionCtx = { waitUntil() {}, passThroughOnException() {} }
+    let cookieHeader: string | null = null
+
+    const client = createTRPCProxyClient<AppRouter>({
+      links: [
+        httpBatchLink({
+          url: 'http://edge.test/trpc',
+          fetch: async (url, options) => {
+            const headers = new Headers(options?.headers)
+            if (cookieHeader) {
+              headers.set('cookie', cookieHeader)
+            }
+
+            const requestInit: RequestInit = {
+              method: options?.method ?? 'GET',
+              headers,
+            }
+            if (options && 'body' in options) {
+              requestInit.body = options.body ?? null
+            }
+
+            const response = await handleEdgeFetch(new Request(String(url), requestInit), env, executionCtx)
+            const setCookie = response.headers.get('set-cookie')
+            if (setCookie) {
+              cookieHeader = setCookie.split(';')[0] ?? null
+            }
+            return response
+          },
+        }),
+      ],
+    })
+
+    await client.auth.login.mutate({ password: 'console-password' })
+
+    await expect(client.hosts.redispatch.mutate({ hostId: 'host-missing-desired' })).rejects.toThrow('desired_not_found')
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-unhealthy/desired',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({
+          services: [
+            {
+              serviceId: 'svc-unhealthy',
+              serviceName: 'unhealthy',
+              localUrl: 'http://127.0.0.1:3011',
+              protocol: 'http',
+              subdomain: 'unhealthy.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+
+    await expect(client.hosts.redispatch.mutate({ hostId: 'host-unhealthy' })).rejects.toThrow('runtime_unhealthy')
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-disconnected/desired',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({
+          services: [
+            {
+              serviceId: 'svc-disconnected',
+              serviceName: 'disconnected',
+              localUrl: 'http://127.0.0.1:3012',
+              protocol: 'http',
+              subdomain: 'disconnected.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+
+    await app.request(
+      'http://edge.test/api/hosts/host-disconnected/services',
+      {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${buildHostToken('host-disconnected', env.OPERATOR_TOKEN)}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          sessionId: 'session-disconnected',
+          version: 1,
+          services: [
+            {
+              serviceId: 'svc-disconnected',
+              serviceName: 'disconnected',
+              localUrl: 'http://127.0.0.1:3012',
+              protocol: 'http',
+              subdomain: 'disconnected.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+
+    const disconnectedStub = env.HOST_SESSION.get(env.HOST_SESSION.idFromName('host-disconnected')) as FakeHostStub
+    disconnectedStub.dispatchConnected = false
+
+    await expect(client.hosts.redispatch.mutate({ hostId: 'host-disconnected' })).rejects.toThrow('host_not_connected')
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-healthy/desired',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({
+          services: [
+            {
+              serviceId: 'svc-healthy',
+              serviceName: 'healthy',
+              localUrl: 'http://127.0.0.1:3013',
+              protocol: 'http',
+              subdomain: 'healthy.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+
+    await app.request(
+      'http://edge.test/api/hosts/host-healthy/services',
+      {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${buildHostToken('host-healthy', env.OPERATOR_TOKEN)}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          sessionId: 'session-healthy',
+          version: 1,
+          services: [
+            {
+              serviceId: 'svc-healthy',
+              serviceName: 'healthy',
+              localUrl: 'http://127.0.0.1:3013',
+              protocol: 'http',
+              subdomain: 'healthy.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+
+    await expect(client.hosts.redispatch.mutate({ hostId: 'host-healthy' })).resolves.toEqual({ generation: 1 })
   })
 
 

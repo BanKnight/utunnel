@@ -513,6 +513,49 @@ export const dispatchDesiredConfigToHost = async (env: EdgeBindings, hostId: str
   return { ok: true as const, dispatched: true as const, generation: desired.generation }
 }
 
+export const redispatchDesiredConfigToHost = async (
+  env: EdgeBindings,
+  hostId: string,
+): Promise<ControlPlaneMutationResult<{ generation: number }>> => {
+  const desired = await getDesiredHostConfig(env, hostId)
+  if (!desired) {
+    return { ok: false, status: 409, reason: 'desired_not_found' }
+  }
+
+  const edgeEnv = parseEdgeEnv(env)
+  const hostSessionResponse = await getHostStub(env, hostId).fetch('https://host.internal/session')
+  const session = (await readJson<HostSessionRecord | null>(hostSessionResponse)) ?? null
+  if (!session || !isSessionHealthy(session, edgeEnv.HEARTBEAT_GRACE_MS)) {
+    return { ok: false, status: 409, reason: 'runtime_unhealthy' }
+  }
+
+  const message = configDispatchMessageSchema.parse({
+    type: 'config_dispatch',
+    payload: {
+      hostId,
+      generation: desired.generation,
+      desired,
+      dispatchedAt: Date.now(),
+      idempotencyKey: crypto.randomUUID(),
+    },
+  })
+
+  const dispatchResult = await readMutationResult<{ ok: true }>(
+    await getHostStub(env, hostId).fetch(toJsonRequest('https://host.internal/control/dispatch', message)),
+  )
+
+  if (!dispatchResult.ok) {
+    return dispatchResult
+  }
+
+  return {
+    ok: true,
+    value: {
+      generation: desired.generation,
+    },
+  }
+}
+
 export const applyDesiredHostServices = async (
   env: EdgeBindings,
   hostId: string,
