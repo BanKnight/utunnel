@@ -491,6 +491,11 @@ const applyDesiredConfig = async (
       dispatch.payload.desired.services,
       token,
     )
+
+    if (runtime.applyingGeneration !== dispatch.payload.generation) {
+      return
+    }
+
     runtime.activeServices = dispatch.payload.desired.services
     runtime.appliedGeneration = dispatch.payload.generation
     sendReconcileAck(socket, config.hostId, dispatch.payload.generation, 'applied')

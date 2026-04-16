@@ -575,5 +575,302 @@ describe('agent runtime helpers', () => {
     ])
   })
 
+  test('does not apply stale completion after a newer generation starts applying', async () => {
+    const runtime: AgentRuntimeContext = {
+      activeServices: [
+        {
+          serviceId: 'svc-initial',
+          serviceName: 'initial',
+          localUrl: 'http://127.0.0.1:3001',
+          protocol: 'http',
+          subdomain: 'initial.example.test',
+        },
+      ],
+      appliedGeneration: null,
+      applyingGeneration: null,
+    }
+    const state = createNextRuntimeState()
+    const config = parseAgentConfig({
+      hostId: 'host-1',
+      hostname: 'host-1',
+      token: 'host-token',
+      edgeBaseUrl: 'http://edge.test',
+      services: runtime.activeServices,
+    })
+    const edgeMessages: string[] = []
+
+    const dispatchGenerationThree = JSON.stringify({
+      type: 'config_dispatch',
+      payload: {
+        hostId: 'host-1',
+        generation: 3,
+        desired: {
+          hostId: 'host-1',
+          generation: 3,
+          updatedAt: Date.now(),
+          services: [
+            {
+              serviceId: 'svc-three',
+              serviceName: 'three',
+              localUrl: 'http://127.0.0.1:3103',
+              protocol: 'http',
+              subdomain: 'three.example.test',
+            },
+          ],
+        },
+        dispatchedAt: Date.now(),
+        idempotencyKey: 'dispatch-3',
+      },
+    })
+
+    const dispatchGenerationFour = JSON.stringify({
+      type: 'config_dispatch',
+      payload: {
+        hostId: 'host-1',
+        generation: 4,
+        desired: {
+          hostId: 'host-1',
+          generation: 4,
+          updatedAt: Date.now(),
+          services: [
+            {
+              serviceId: 'svc-four',
+              serviceName: 'four',
+              localUrl: 'http://127.0.0.1:3104',
+              protocol: 'http',
+              subdomain: 'four.example.test',
+            },
+          ],
+        },
+        dispatchedAt: Date.now(),
+        idempotencyKey: 'dispatch-4',
+      },
+    })
+
+    const originalFetch = globalThis.fetch
+    const pendingResolvers: Array<(value: Response) => void> = []
+    globalThis.fetch = (async (_input: RequestInfo | URL, _init?: RequestInit) => {
+      return await new Promise<Response>((resolve) => {
+        pendingResolvers.push(resolve)
+      })
+    }) as typeof fetch
+
+    try {
+      const applyThree = handleAgentSocketMessage(
+        dispatchGenerationThree,
+        runtime,
+        state,
+        config,
+        { send: (data: string) => edgeMessages.push(data) },
+        createRelayState(),
+        'host-token',
+      )
+      await Promise.resolve()
+
+      const applyFour = handleAgentSocketMessage(
+        dispatchGenerationFour,
+        runtime,
+        state,
+        config,
+        { send: (data: string) => edgeMessages.push(data) },
+        createRelayState(),
+        'host-token',
+      )
+      await Promise.resolve()
+
+      expect(runtime.applyingGeneration).toBe(4)
+      expect(pendingResolvers).toHaveLength(2)
+
+      pendingResolvers[0]?.(Response.json({ ok: true }))
+      await applyThree
+      expect(runtime.appliedGeneration).toBeNull()
+      expect(runtime.activeServices.map((service) => service.serviceId)).toEqual(['svc-initial'])
+
+      pendingResolvers[1]?.(Response.json({ ok: true }))
+      await applyFour
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+
+    expect(runtime.appliedGeneration).toBe(4)
+    expect(runtime.activeServices.map((service) => service.serviceId)).toEqual(['svc-four'])
+    expect(edgeMessages.map((item) => JSON.parse(item))).toEqual([
+      {
+        type: 'reconcile_ack',
+        payload: {
+          hostId: 'host-1',
+          generation: 3,
+          status: 'acknowledged',
+          acknowledgedAt: expect.any(Number),
+        },
+      },
+      {
+        type: 'reconcile_ack',
+        payload: {
+          hostId: 'host-1',
+          generation: 4,
+          status: 'acknowledged',
+          acknowledgedAt: expect.any(Number),
+        },
+      },
+      {
+        type: 'reconcile_ack',
+        payload: {
+          hostId: 'host-1',
+          generation: 4,
+          status: 'applied',
+          acknowledgedAt: expect.any(Number),
+        },
+      },
+    ])
+  })
+
+  test('reports reconcile error for the newest generation when apply fails', async () => {
+    const runtime: AgentRuntimeContext = {
+      activeServices: [
+        {
+          serviceId: 'svc-initial',
+          serviceName: 'initial',
+          localUrl: 'http://127.0.0.1:3001',
+          protocol: 'http',
+          subdomain: 'initial.example.test',
+        },
+      ],
+      appliedGeneration: null,
+      applyingGeneration: null,
+    }
+    const state = createNextRuntimeState()
+    const config = parseAgentConfig({
+      hostId: 'host-1',
+      hostname: 'host-1',
+      token: 'host-token',
+      edgeBaseUrl: 'http://edge.test',
+      services: runtime.activeServices,
+    })
+    const edgeMessages: string[] = []
+
+    const dispatchGenerationThree = JSON.stringify({
+      type: 'config_dispatch',
+      payload: {
+        hostId: 'host-1',
+        generation: 3,
+        desired: {
+          hostId: 'host-1',
+          generation: 3,
+          updatedAt: Date.now(),
+          services: [
+            {
+              serviceId: 'svc-three',
+              serviceName: 'three',
+              localUrl: 'http://127.0.0.1:3103',
+              protocol: 'http',
+              subdomain: 'three.example.test',
+            },
+          ],
+        },
+        dispatchedAt: Date.now(),
+        idempotencyKey: 'dispatch-3',
+      },
+    })
+
+    const dispatchGenerationFour = JSON.stringify({
+      type: 'config_dispatch',
+      payload: {
+        hostId: 'host-1',
+        generation: 4,
+        desired: {
+          hostId: 'host-1',
+          generation: 4,
+          updatedAt: Date.now(),
+          services: [
+            {
+              serviceId: 'svc-four',
+              serviceName: 'four',
+              localUrl: 'http://127.0.0.1:3104',
+              protocol: 'http',
+              subdomain: 'four.example.test',
+            },
+          ],
+        },
+        dispatchedAt: Date.now(),
+        idempotencyKey: 'dispatch-4',
+      },
+    })
+
+    const originalFetch = globalThis.fetch
+    const pendingResolvers: Array<{ resolve: (value: Response) => void; url: string }> = []
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? input : new Request(input, init)
+      return await new Promise<Response>((resolve) => {
+        pendingResolvers.push({ resolve, url: request.url })
+      })
+    }) as typeof fetch
+
+    try {
+      const applyThree = handleAgentSocketMessage(
+        dispatchGenerationThree,
+        runtime,
+        state,
+        config,
+        { send: (data: string) => edgeMessages.push(data) },
+        createRelayState(),
+        'host-token',
+      )
+      await Promise.resolve()
+
+      const applyFour = handleAgentSocketMessage(
+        dispatchGenerationFour,
+        runtime,
+        state,
+        config,
+        { send: (data: string) => edgeMessages.push(data) },
+        createRelayState(),
+        'host-token',
+      )
+      await Promise.resolve()
+
+      pendingResolvers[0]?.resolve(Response.json({ ok: true }))
+      await applyThree
+
+      pendingResolvers[1]?.resolve(new Response('apply failed', { status: 503 }))
+      await applyFour
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+
+    expect(runtime.appliedGeneration).toBeNull()
+    expect(runtime.activeServices.map((service) => service.serviceId)).toEqual(['svc-initial'])
+    expect(edgeMessages.map((item) => JSON.parse(item))).toEqual([
+      {
+        type: 'reconcile_ack',
+        payload: {
+          hostId: 'host-1',
+          generation: 3,
+          status: 'acknowledged',
+          acknowledgedAt: expect.any(Number),
+        },
+      },
+      {
+        type: 'reconcile_ack',
+        payload: {
+          hostId: 'host-1',
+          generation: 4,
+          status: 'acknowledged',
+          acknowledgedAt: expect.any(Number),
+        },
+      },
+      {
+        type: 'reconcile_ack',
+        payload: {
+          hostId: 'host-1',
+          generation: 4,
+          status: 'error',
+          acknowledgedAt: expect.any(Number),
+          error: 'Failed to services services: 503',
+        },
+      },
+    ])
+  })
+
 })
 

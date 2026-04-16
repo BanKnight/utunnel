@@ -412,6 +412,14 @@ class FakeHostStub {
     }
   } | null = null
   dispatchConnected = true
+  dispatchHistory: Array<{
+    hostId: string
+    generation: number
+    desired: {
+      generation: number
+      services: Array<{ serviceId: string; serviceName: string; subdomain: string; protocol: 'http' | 'websocket' }>
+    }
+  }> = []
   lastRelayWs: {
     expectedSessionId: string
     expectedVersion: number
@@ -541,6 +549,25 @@ class FakeHostStub {
       if (!this.dispatchConnected) {
         return Response.json({ ok: false, reason: 'host_not_connected' }, { status: 503 })
       }
+
+      const message = (await request.json()) as {
+        payload: {
+          hostId: string
+          generation: number
+          desired: {
+            generation: number
+            services: Array<{ serviceId: string; serviceName: string; subdomain: string; protocol: 'http' | 'websocket' }>
+          }
+        }
+      }
+      this.dispatchHistory.push({
+        hostId: message.payload.hostId,
+        generation: message.payload.generation,
+        desired: {
+          generation: message.payload.desired.generation,
+          services: message.payload.desired.services,
+        },
+      })
       return Response.json({ ok: true })
     }
 
@@ -614,6 +641,7 @@ type HostControlState = {
     status: 'pending' | 'acknowledged' | 'error'
     services: Array<{ serviceId: string; serviceName: string; subdomain: string; protocol: 'http' | 'websocket' }>
     error?: string | undefined
+    reportedAt: number
   } | null
   applied: {
     generation: number
@@ -1071,6 +1099,110 @@ describe('edge app integration', () => {
     await expect(client.hosts.redispatch.mutate({ hostId: 'host-healthy' })).resolves.toEqual({ generation: 1 })
   })
 
+  test('surfaces current error state after a failed reconcile report', async () => {
+    const env = {
+      ...createEnv(),
+      UI_PASSWORD: 'console-password',
+      SESSION_SECRET: 'session-secret',
+      SESSION_TTL_MS: '3600000',
+    }
+    const operatorHeader = {
+      authorization: 'Bearer dev-operator-token',
+      'content-type': 'application/json',
+    }
+
+    await app.request(
+      'http://edge.test/api/control/hosts/host-error/desired',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({
+          services: [
+            {
+              serviceId: 'svc-error',
+              serviceName: 'error-service',
+              localUrl: 'http://127.0.0.1:3021',
+              protocol: 'http',
+              subdomain: 'error.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+
+    const currentResponse = await app.request(
+      'http://edge.test/api/control/hosts/host-error/current',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({
+          generation: 1,
+          status: 'error',
+          error: 'apply_failed',
+          services: [
+            {
+              serviceId: 'svc-error',
+              serviceName: 'error-service',
+              localUrl: 'http://127.0.0.1:3021',
+              protocol: 'http',
+              subdomain: 'error.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+    expect(currentResponse.status).toBe(200)
+
+    const hostsResponse = await app.request(
+      'http://edge.test/api/control/hosts',
+      { headers: { authorization: 'Bearer dev-operator-token' } },
+      env,
+    )
+    const hostsJson = (await hostsResponse.json()) as HostControlState[]
+    const erroredHost = hostsJson.find((host) => host.hostId === 'host-error')
+    expect(erroredHost?.current?.status).toBe('error')
+    expect(erroredHost?.current?.error).toBe('apply_failed')
+    expect(erroredHost?.current?.reportedAt).toBeTypeOf('number')
+
+    const executionCtx = { waitUntil() {}, passThroughOnException() {} }
+    let cookieHeader: string | null = null
+
+    const client = createTRPCProxyClient<AppRouter>({
+      links: [
+        httpBatchLink({
+          url: 'http://edge.test/trpc',
+          fetch: async (url, options) => {
+            const headers = new Headers(options?.headers)
+            if (cookieHeader) {
+              headers.set('cookie', cookieHeader)
+            }
+
+            const requestInit: RequestInit = {
+              method: options?.method ?? 'GET',
+              headers,
+            }
+            if (options && 'body' in options) {
+              requestInit.body = options.body ?? null
+            }
+
+            const response = await handleEdgeFetch(new Request(String(url), requestInit), env, executionCtx)
+            const setCookie = response.headers.get('set-cookie')
+            if (setCookie) {
+              cookieHeader = setCookie.split(';')[0] ?? null
+            }
+            return response
+          },
+        }),
+      ],
+    })
+
+    await client.auth.login.mutate({ password: 'console-password' })
+    const summaryResult = await client.dashboard.summary.query()
+    const erroredSummary = summaryResult.recentHosts.find((host) => host.hostId === 'host-error')
+    expect(erroredSummary?.currentStatus).toBe('error')
+  })
 
   test('clears host control state through control shell tRPC', async () => {
     const env = {
@@ -3624,8 +3756,257 @@ describe('edge app integration', () => {
     expect(json).toEqual({ ok: false, reason: 'stale_session_binding' })
   })
 
-  test('rebinds to a new session and restores traffic with the same hostname', async () => {
+  test('dispatches desired update to an online host session', async () => {
+    const env = createEnv()
+    const authHeader = {
+      authorization: `Bearer ${buildHostToken('host-online', env.OPERATOR_TOKEN)}`,
+      'content-type': 'application/json',
+    }
 
+    const register = await app.request(
+      'http://edge.test/api/hosts/host-online/services',
+      {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({
+          sessionId: 'session-online-1',
+          version: 1,
+          services: [
+            {
+              serviceId: 'svc-online-old',
+              serviceName: 'online-old',
+              localUrl: 'http://127.0.0.1:3011',
+              protocol: 'http',
+              subdomain: 'online-old.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+    expect(register.status).toBe(200)
+
+    const desiredUpdate = await app.request(
+      'http://edge.test/api/control/hosts/host-online/desired',
+      {
+        method: 'POST',
+        headers: {
+          authorization: 'Bearer dev-operator-token',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          services: [
+            {
+              serviceId: 'svc-online-new',
+              serviceName: 'online-new',
+              localUrl: 'http://127.0.0.1:3012',
+              protocol: 'http',
+              subdomain: 'online-new.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+    expect(desiredUpdate.status).toBe(200)
+
+    const hostStub = env.HOST_SESSION.get('host-online')
+    expect(hostStub.dispatchHistory).toHaveLength(1)
+    expect(hostStub.dispatchHistory[0]).toMatchObject({
+      hostId: 'host-online',
+      generation: 1,
+      desired: {
+        generation: 1,
+      },
+    })
+    expect(hostStub.dispatchHistory[0]?.desired.services.map((service) => service.serviceId)).toEqual(['svc-online-new'])
+  })
+
+  test('redispatches latest desired after reconnect when earlier dispatch missed', async () => {
+    const env = createEnv()
+    const authHeader = {
+      authorization: `Bearer ${buildHostToken('host-reconnect', env.OPERATOR_TOKEN)}`,
+      'content-type': 'application/json',
+    }
+
+    const register = await app.request(
+      'http://edge.test/api/hosts/host-reconnect/services',
+      {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({
+          sessionId: 'session-reconnect-1',
+          version: 1,
+          services: [
+            {
+              serviceId: 'svc-reconnect-old',
+              serviceName: 'reconnect-old',
+              localUrl: 'http://127.0.0.1:3013',
+              protocol: 'http',
+              subdomain: 'reconnect-old.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+    expect(register.status).toBe(200)
+
+    const hostStub = env.HOST_SESSION.get('host-reconnect')
+    hostStub.dispatchConnected = false
+
+    const desiredUpdate = await app.request(
+      'http://edge.test/api/control/hosts/host-reconnect/desired',
+      {
+        method: 'POST',
+        headers: {
+          authorization: 'Bearer dev-operator-token',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          services: [
+            {
+              serviceId: 'svc-reconnect-new',
+              serviceName: 'reconnect-new',
+              localUrl: 'http://127.0.0.1:3014',
+              protocol: 'http',
+              subdomain: 'reconnect-new.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+    expect(desiredUpdate.status).toBe(200)
+    expect(hostStub.dispatchHistory).toHaveLength(0)
+
+    const disconnect = await app.request(
+      'http://edge.test/api/hosts/host-reconnect/disconnect',
+      { method: 'POST', headers: authHeader },
+      env,
+    )
+    expect(disconnect.status).toBe(200)
+
+    hostStub.dispatchConnected = true
+
+    const rebind = await app.request(
+      'http://edge.test/api/hosts/host-reconnect/rebind',
+      {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({
+          previousSessionId: 'session-reconnect-1',
+          sessionId: 'session-reconnect-2',
+          version: 2,
+          services: [
+            {
+              serviceId: 'svc-reconnect-new',
+              serviceName: 'reconnect-new',
+              localUrl: 'http://127.0.0.1:3014',
+              protocol: 'http',
+              subdomain: 'reconnect-new.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+
+    expect(rebind.status).toBe(200)
+    expect(hostStub.dispatchHistory).toHaveLength(1)
+    expect(hostStub.dispatchHistory[0]).toMatchObject({
+      hostId: 'host-reconnect',
+      generation: 1,
+      desired: {
+        generation: 1,
+      },
+    })
+    expect(hostStub.dispatchHistory[0]?.desired.services.map((service) => service.serviceId)).toEqual(['svc-reconnect-new'])
+  })
+
+  test('always dispatches the latest desired generation after consecutive updates', async () => {
+    const env = createEnv()
+    const authHeader = {
+      authorization: `Bearer ${buildHostToken('host-latest', env.OPERATOR_TOKEN)}`,
+      'content-type': 'application/json',
+    }
+
+    const register = await app.request(
+      'http://edge.test/api/hosts/host-latest/services',
+      {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({
+          sessionId: 'session-latest-1',
+          version: 1,
+          services: [
+            {
+              serviceId: 'svc-latest-initial',
+              serviceName: 'latest-initial',
+              localUrl: 'http://127.0.0.1:3015',
+              protocol: 'http',
+              subdomain: 'latest-initial.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+    expect(register.status).toBe(200)
+
+    const operatorHeader = {
+      authorization: 'Bearer dev-operator-token',
+      'content-type': 'application/json',
+    }
+
+    const firstDesired = await app.request(
+      'http://edge.test/api/control/hosts/host-latest/desired',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({
+          services: [
+            {
+              serviceId: 'svc-latest-v1',
+              serviceName: 'latest-v1',
+              localUrl: 'http://127.0.0.1:3016',
+              protocol: 'http',
+              subdomain: 'latest-v1.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+    expect(firstDesired.status).toBe(200)
+
+    const secondDesired = await app.request(
+      'http://edge.test/api/control/hosts/host-latest/desired',
+      {
+        method: 'POST',
+        headers: operatorHeader,
+        body: JSON.stringify({
+          services: [
+            {
+              serviceId: 'svc-latest-v2',
+              serviceName: 'latest-v2',
+              localUrl: 'http://127.0.0.1:3017',
+              protocol: 'http',
+              subdomain: 'latest-v2.example.test',
+            },
+          ],
+        }),
+      },
+      env,
+    )
+    expect(secondDesired.status).toBe(200)
+
+    const hostStub = env.HOST_SESSION.get('host-latest')
+    expect(hostStub.dispatchHistory.map((entry) => entry.generation)).toEqual([1, 2])
+    expect(hostStub.dispatchHistory[1]?.desired.services.map((service) => service.serviceId)).toEqual(['svc-latest-v2'])
+  })
+
+  test('rebinds to a new session and restores traffic with the same hostname', async () => {
     const env = createEnv()
     const authHeader = {
       authorization: `Bearer ${buildHostToken('host-1', env.OPERATOR_TOKEN)}`,
