@@ -183,6 +183,72 @@ const cloneServices = (services: ControlPlaneService[] | null | undefined) => {
   return (services ?? []).map((service) => ({ ...service }))
 }
 
+const REACHABILITY_BAR_COUNT = 12
+const REACHABILITY_STALE_MS = 15 * 60 * 1000
+
+type ReachabilityBarResult = ControlPlaneServiceReachabilitySummary['recentResults'][number]
+
+const buildReachabilityBars = (results: ReachabilityBarResult[]) => {
+  const chronological = [...results].reverse().slice(-REACHABILITY_BAR_COUNT)
+  const padded = Array.from(
+    { length: Math.max(REACHABILITY_BAR_COUNT - chronological.length, 0) },
+    () => null as ReachabilityBarResult | null,
+  )
+  return [...padded, ...chronological]
+}
+
+const isReachabilityStale = (checkedAt: number | null) => {
+  if (checkedAt === null) {
+    return false
+  }
+  return Date.now() - checkedAt > REACHABILITY_STALE_MS
+}
+
+const getReachabilityLabel = (summary: ControlPlaneServiceReachabilitySummary) => {
+  if (summary.checkedAt === null) {
+    return { text: '无数据', className: 'text-slate-400' }
+  }
+  if (isReachabilityStale(summary.checkedAt)) {
+    return { text: '已过期', className: 'text-slate-400' }
+  }
+  if (summary.reachability === 'reachable') {
+    return { text: '可达', className: 'text-emerald-400' }
+  }
+  if (summary.reachability === 'degraded') {
+    return { text: '不稳定', className: 'text-amber-400' }
+  }
+  if (summary.reachability === 'unreachable') {
+    return { text: '不可达', className: 'text-rose-400' }
+  }
+  return { text: '未知', className: 'text-slate-400' }
+}
+
+const formatReachabilityTooltip = (result: ReachabilityBarResult | null) => {
+  if (!result) {
+    return '暂无数据'
+  }
+
+  return [
+    `时间：${new Date(result.checkedAt).toLocaleString()}`,
+    `结果：${result.success ? '成功' : '失败'}`,
+    result.statusCode === undefined ? null : `状态码：${result.statusCode}`,
+    result.latencyMs === undefined ? null : `耗时：${result.latencyMs}ms`,
+    result.failureKind ? `失败原因：${result.failureKind}` : null,
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
+
+const getReachabilityBarClassName = (summary: ControlPlaneServiceReachabilitySummary, result: ReachabilityBarResult | null) => {
+  if (!result) {
+    return 'bg-slate-700'
+  }
+  if (isReachabilityStale(summary.checkedAt)) {
+    return result.success ? 'bg-emerald-700/70' : 'bg-rose-700/70'
+  }
+  return result.success ? 'bg-emerald-400' : 'bg-rose-400'
+}
+
 const cloneServiceDrafts = (services: ControlPlaneServiceDraft[] | null | undefined) => {
   return (services ?? []).map((service) => ({ ...service }))
 }
@@ -769,38 +835,46 @@ function HostsPage() {
             <div className="rounded-md border border-slate-800 p-4 space-y-3">
               <div>
                 <p className="text-sm font-medium text-slate-200">Service reachability</p>
-                <p className="text-sm text-slate-500">从 utunnel 公网入口视角展示最近一次 probe 与最近几次结果。</p>
+                <p className="text-sm text-slate-500">用 12 个小竖条展示最近观测结果，左边更早，右边更新。灰色表示无数据；如果最近结果太旧，当前状态会显示为已过期。</p>
               </div>
               {serviceSummaries.length > 0 ? (
                 <div className="space-y-3">
-                  {serviceSummaries.map((summary) => (
-                    <div key={`${summary.hostId}-${summary.serviceId}`} className="rounded-md border border-slate-800 px-4 py-3">
-                      <div className="flex items-start justify-between gap-4">
-                        <div>
-                          <p className="font-medium text-slate-100">{summary.serviceName} · {summary.subdomain}</p>
-                          <p className="text-sm text-slate-400">{summary.serviceId} · {summary.protocol} · {summary.hasProjectedRoute ? 'projected' : 'not projected'}</p>
+                  {serviceSummaries.map((summary) => {
+                    const reachabilityLabel = getReachabilityLabel(summary)
+                    const bars = buildReachabilityBars(summary.recentResults)
+                    return (
+                      <div key={`${summary.hostId}-${summary.serviceId}`} className="rounded-md border border-slate-800 px-4 py-3">
+                        <div className="flex items-start justify-between gap-4">
+                          <div>
+                            <p className="font-medium text-slate-100">{summary.serviceName} · {summary.subdomain}</p>
+                            <p className="text-sm text-slate-400">{summary.serviceId} · {summary.protocol} · {summary.hasProjectedRoute ? 'projected' : 'not projected'}</p>
+                          </div>
+                          <div className="text-right">
+                            <p className={`text-sm ${reachabilityLabel.className}`}>{reachabilityLabel.text}</p>
+                            <p className="text-xs text-slate-500">最近检查：{summary.checkedAt ? new Date(summary.checkedAt).toLocaleTimeString() : '—'}</p>
+                          </div>
                         </div>
-                        <div className="text-right">
-                          <p className={summary.reachability === 'reachable' ? 'text-sm text-emerald-400' : summary.reachability === 'degraded' ? 'text-sm text-amber-400' : summary.reachability === 'unreachable' ? 'text-sm text-rose-400' : 'text-sm text-slate-400'}>
-                            {summary.reachability}
-                          </p>
-                          <p className="text-xs text-slate-500">checked: {summary.checkedAt ? new Date(summary.checkedAt).toLocaleTimeString() : '—'}</p>
+                        <div className="mt-3 flex items-end gap-1" aria-label={`${summary.serviceName} 最近 12 次观测结果`}>
+                          {bars.map((result, index) => (
+                            <span
+                              key={`${summary.serviceId}-bar-${index}-${result?.checkedAt ?? 'empty'}`}
+                              className={`h-8 w-2 rounded-sm ${getReachabilityBarClassName(summary, result)}`}
+                              title={formatReachabilityTooltip(result)}
+                            />
+                          ))}
+                        </div>
+                        <div className="mt-2 flex flex-wrap gap-3 text-xs text-slate-500">
+                          <p>最近成功：{summary.lastSuccessAt ? new Date(summary.lastSuccessAt).toLocaleTimeString() : '—'}</p>
+                          <p>最近失败：{summary.lastFailureAt ? new Date(summary.lastFailureAt).toLocaleTimeString() : '—'}</p>
+                        </div>
+                        <div className="mt-3 grid gap-2 text-xs text-slate-500 md:grid-cols-3">
+                          <p>desired g{summary.desiredGeneration ?? '—'}</p>
+                          <p>current g{summary.currentGeneration ?? '—'} · {summary.currentStatus ?? '—'}</p>
+                          <p>applied g{summary.appliedGeneration ?? '—'}</p>
                         </div>
                       </div>
-                      <div className="mt-3 flex flex-wrap gap-2 text-xs">
-                        {summary.recentResults.length > 0 ? summary.recentResults.map((result) => (
-                          <span key={`${summary.serviceId}-${result.checkedAt}`} className={result.success ? 'rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-1 text-emerald-300' : 'rounded-full border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-rose-300'}>
-                            {result.success ? 'ok' : result.failureKind ?? 'fail'} · {new Date(result.checkedAt).toLocaleTimeString()}
-                          </span>
-                        )) : <span className="text-slate-500">尚无 probe 结果</span>}
-                      </div>
-                      <div className="mt-3 grid gap-2 text-xs text-slate-500 md:grid-cols-3">
-                        <p>desired g{summary.desiredGeneration ?? '—'}</p>
-                        <p>current g{summary.currentGeneration ?? '—'} · {summary.currentStatus ?? '—'}</p>
-                        <p>applied g{summary.appliedGeneration ?? '—'}</p>
-                      </div>
-                    </div>
-                  ))}
+                    )
+                  })}
                 </div>
               ) : (
                 <p className="text-sm text-slate-500">当前 host 还没有 service reachability 摘要。</p>
